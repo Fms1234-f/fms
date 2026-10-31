@@ -1256,10 +1256,8 @@ class RunController:
         from . import single_post_test as _spt
         label = account["label"]
         aid = account["id"]
-        try:
-            driver.keep_open = True
-        except Exception:
-            pass
+        # v0.2.176: no keep_open here — on success the worker auto-closes
+        # the browser (standard rule); on failure it stays open by design.
         try:
             tab_count = max(1, int(self.cfg.tabs_without_limit or 1))
         except (TypeError, ValueError):
