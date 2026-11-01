@@ -225,6 +225,10 @@ class BaseDriver(ABC):
         """Navigate the main page to Marketplace (Download Images & Titles)."""
         raise NotImplementedError
 
+    def open_url(self, url: str) -> None:
+        """Navigate the main page to an arbitrary URL (Browser Launch Fast)."""
+        raise NotImplementedError
+
     def download_open_tabs(self, dest_dir: str) -> list[dict]:
         """Download images + titles from every open tab except the first.
         Returns [{title, photo_paths}]."""
@@ -4621,6 +4625,17 @@ class PlaywrightDriver(BaseDriver):
         except Exception:
             pass
 
+    def open_url(self, url: str) -> None:
+        """Browser Launch Fast: navigate the main page to the given URL.
+
+        A failed navigation raises (unlike goto_messages) so the account
+        fails instead of reporting a Done it never opened.
+        """
+        self._ensure()
+        page = self._page
+        assert page is not None
+        page.goto(url, wait_until="domcontentloaded")
+
     def close(self) -> None:
         try:
             if self._context:
@@ -4910,6 +4925,9 @@ class MockDriver(BaseDriver):
 
     def launch_fast(self) -> None:
         self._record("launch_fast", outcome="completed")
+
+    def open_url(self, url: str) -> None:
+        self._record("open_url", url=url)
 
 
 # class-level counters (assigned after class creation to keep reset() simple)

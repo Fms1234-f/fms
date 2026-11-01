@@ -140,6 +140,7 @@ class RunConfig:
     tabs_without_limit: int = 2      # total reusable tabs; sequential publishing only
     tabs_draft_publish: int = 6      # draft batch size for draft & publish
     action_urls: list[str] = field(default_factory=list)  # scrap_data / download_images_titles
+    launch_url: str = ""  # browser_launch_fast: URL opened per account; empty -> https://www.facebook.com/
     scrap_include_description: bool = True   # scrap_data: also copy description
     scrap_include_location: bool = True      # scrap_data: also copy location
     download_folder: str | None = None       # download_images_titles target dir
@@ -605,6 +606,21 @@ class _Rotator:
         }
 
 
+def _normalize_launch_url(raw: str | None) -> str:
+    """Browser Launch Fast: user-typed URL -> absolute https URL.
+
+    Empty -> https://www.facebook.com/ (feed). A bare domain or path gets
+    https:// prepended; an existing http(s):// scheme is kept as-is.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return "https://www.facebook.com/"
+    low = value.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return value
+    return "https://" + value
+
+
 class RunController:
     """Owns one run's background thread, pause/stop signals and rotation state."""
 
@@ -1040,6 +1056,15 @@ class RunController:
             # Identical in the real tool (confirmed 2026-10-15): log in,
             # then leave the browser open for manual work.
             driver.keep_open = True
+            if mode == "browser_launch_fast":
+                # v0.2.177: open the user's launch URL (dashboard box;
+                # empty -> facebook.com feed), then Done, browser left open.
+                # A failed navigation raises, so the account fails (browser
+                # stays open for inspection) instead of a false Done.
+                launch_url = _normalize_launch_url(self.cfg.launch_url)
+                driver.open_url(launch_url)
+                self.log(f"[{label}] launch URL opened: {launch_url} — browser left open",
+                         account_id=account["id"])
             self.log(f"[{label}] browser launched — left open for manual work",
                      account_id=account["id"])
         elif mode == "change_location":

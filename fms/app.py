@@ -118,6 +118,7 @@ class RunIn(BaseModel):
     tabs_without_limit: int = 2
     tabs_draft_publish: int = 6
     action_urls: list[str] = []
+    launch_url: str = ""
     new_location: str | None = None
     wait_minutes: float = 0
     exclude_labels: list[str] = []
