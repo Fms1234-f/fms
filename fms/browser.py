@@ -4570,8 +4570,130 @@ class PlaywrightDriver(BaseDriver):
         self._activity_loop(S.HOME_URL, minutes)
 
     def watch_reels(self, minutes: float, probs: dict | None = None) -> None:
-        self._activity_loop("https://www.facebook.com/reel/", minutes,
-                            scrolls_per_min=3)
+        self._watch_reels_loop(minutes)
+
+    def _current_reel_state(self, page) -> dict | None:
+        """Video state of the reel currently on screen, or None.
+
+        v0.2.180: the generic activity scroll never advanced past one
+        reel (250-700px wheel steps vs a full-viewport reel), so reels
+        get their own loop. Prefers the playing video; falls back to
+        any video with a finite duration.
+        """
+        try:
+            state = page.evaluate("""() => {
+                const vids = [...document.querySelectorAll('video')];
+                const v = vids.find(v => !v.paused && v.duration
+                    && isFinite(v.duration) && v.duration > 0)
+                    || vids.find(v => v.duration
+                    && isFinite(v.duration) && v.duration > 0);
+                if (!v) return null;
+                return {src: v.currentSrc || v.src || '',
+                        t: v.currentTime, d: v.duration,
+                        ended: v.ended, paused: v.paused};
+            }""")
+        except Exception:
+            return None
+        if not isinstance(state, dict) or not state.get("d"):
+            return None
+        return state
+
+    def _advance_reel(self, page, end: float | None = None) -> None:
+        """Scroll decisively to the next reel (one full viewport).
+
+        The settle pause is capped by the block end, so the block's
+        total time is a hard cap, never exceeded.
+        """
+        try:
+            height = page.evaluate("window.innerHeight") or 1000
+        except Exception:
+            height = 1000
+        try:
+            page.mouse.wheel(0, float(height))
+        except Exception:
+            try:
+                page.evaluate(f"window.scrollBy(0, {float(height)})")
+            except Exception:
+                pass
+        settle = random.uniform(0.8, 1.5)
+        if end is not None:
+            settle = min(settle, max(0.0, end - time.time()))
+        if settle > 0:
+            time.sleep(settle)
+
+    def _wait_for_reel(self, page, end: float) -> dict | None:
+        """Wait up to 5s (bounded by the block end) for a video reel."""
+        deadline = min(end, time.time() + 5.0)
+        while time.time() < deadline:
+            state = self._current_reel_state(page)
+            if state is not None:
+                return state
+            time.sleep(0.5)
+        return self._current_reel_state(page)
+
+    def _watch_reels_loop(self, minutes: float) -> None:
+        """Watch reels one at a time until the block's total time ends.
+
+        v0.2.180 (user-approved): each reel is watched FULLY, then the
+        loop advances to the next reel — the block's total time (from
+        the script's Min/Max) is the hard cap and is never exceeded,
+        so a block can end mid-reel. A reel counts as fully watched
+        when its video ends, its playhead reaches the end, it loops
+        back after nearing the end, or the wall-clock watch reaches
+        its duration (covers looping/paused players). If an advance
+        does not change the reel, the same reel is never re-watched:
+        it is scrolled past until a new reel appears or time ends.
+        """
+        self._ensure()
+        page = self._page
+        assert page is not None
+        try:
+            page.goto("https://www.facebook.com/reel/",
+                      wait_until="domcontentloaded")
+        except Exception:
+            return
+        end = time.time() + max(0.0, minutes) * 60.0
+        skip_src: str | None = None
+        while time.time() < end:
+            self._pause_checkpoint()
+            state = self._wait_for_reel(page, end)
+            if state is None:
+                # No video card (still loading / non-video): move on.
+                if time.time() < end:
+                    self._advance_reel(page, end)
+                continue
+            if skip_src is not None and state["src"] == skip_src:
+                # Advance did not take: same finished reel again —
+                # never re-watch it, just scroll past it.
+                if time.time() < end:
+                    self._advance_reel(page, end)
+                continue
+            skip_src = None
+            src = state["src"]
+            duration = float(state["d"])
+            started = time.time()
+            prev_t = float(state["t"])
+            near_end = prev_t >= duration - 1.0
+            finished = False
+            while time.time() < end and not finished:
+                self._pause_checkpoint()
+                time.sleep(0.5)
+                cur = self._current_reel_state(page)
+                if cur is None or cur["src"] != src:
+                    break  # video gone / reel changed on its own
+                t = float(cur["t"])
+                if cur["ended"] or t >= duration - 0.5:
+                    finished = True
+                elif near_end and t < prev_t - 1.0:
+                    finished = True  # looped back after nearing the end
+                elif t >= duration - 1.0:
+                    near_end = True
+                prev_t = t
+                if time.time() - started >= duration:
+                    finished = True  # wall-clock: a full play elapsed
+            if finished and time.time() < end:
+                skip_src = src
+                self._advance_reel(page, end)
 
     def watch_videos(self, minutes: float, probs: dict | None = None) -> None:
         self._activity_loop("https://www.facebook.com/watch/", minutes,
