@@ -52,7 +52,7 @@
     <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px 26px;min-width:320px;box-shadow:0 8px 30px rgba(0,0,0,.4)">
       <h3 style="margin:0 0 14px">Listing Settings</h3>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
-        <label><span id="mmMinLabel">Min listings</span><br><input type="number" id="mmMinAds" value="1" min="1" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
+        <label id="mmMinAdsField"><span id="mmMinLabel">Min listings</span><br><input type="number" id="mmMinAds" value="1" min="1" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMaxAdsField"><span id="mmMaxLabel">Max listings</span><br><input type="number" id="mmMaxAds" value="3" min="1" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMinPriceField">Min price<br><input type="number" id="mmMinPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMaxPriceField">Max price<br><input type="number" id="mmMaxPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
@@ -142,10 +142,11 @@ function configureMinMaxDialog(){
   const isLaunchFast = selectedAction === 'browser_launch_fast';
   const isCountOnly = isRenew1 || isDeleteRelist || isPublishDrafts;
   document.getElementById('mmMinLabel').textContent = isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings')));
-  document.getElementById('mmMaxAdsField').style.display = isCreateListingsOnly ? 'none' : '';
+  document.getElementById('mmMaxAdsField').style.display = isLaunchFast ? 'none' : (isCreateListingsOnly ? 'none' : '');
   document.getElementById('mmMaxLabel').textContent = isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings'));
-  document.getElementById('mmMinPriceField').style.display = isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : ''));
-  document.getElementById('mmMaxPriceField').style.display = isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : ''));
+  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : '')));
+  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : '')));
+  document.getElementById('mmMinAdsField').style.display = isLaunchFast ? 'none' : '';
   document.getElementById('mmLaunchUrlField').style.display = isLaunchFast ? '' : 'none';
   document.getElementById('mmHint').textContent = isLaunchFast
     ? 'Har account ka browser isi URL par kholega, ID Done mein jayegi aur browser khula rahega.'
