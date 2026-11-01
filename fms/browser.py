@@ -4599,20 +4599,28 @@ class PlaywrightDriver(BaseDriver):
         return state
 
     def _advance_reel(self, page, end: float | None = None) -> None:
-        """Scroll decisively to the next reel (one full viewport).
+        """Go to the next reel via the viewer's down-arrow button.
 
-        The settle pause is capped by the block end, so the block's
-        total time is a hard cap, never exceeded.
+        v0.2.181: mouse wheel + document scroll cannot navigate the
+        desktop Reels viewer (fixed page, no scroll; the wheel lands
+        top-left, not on the video — user-verified on v0.2.180, which
+        stayed stuck on one reel). The viewer navigates via its
+        right-side up/down arrow buttons, so click the down (next)
+        arrow; if no such button is found, fall back to the ArrowDown
+        key. The settle pause stays capped by the block end, so the
+        block's total time is a hard cap, never exceeded.
         """
+        clicked = False
         try:
-            height = page.evaluate("window.innerHeight") or 1000
+            btn = page.get_by_role(
+                "button", name=re.compile("next", re.I)).first
+            btn.click(timeout=1500)
+            clicked = True
         except Exception:
-            height = 1000
-        try:
-            page.mouse.wheel(0, float(height))
-        except Exception:
+            pass
+        if not clicked:
             try:
-                page.evaluate(f"window.scrollBy(0, {float(height)})")
+                page.keyboard.press("ArrowDown")
             except Exception:
                 pass
         settle = random.uniform(0.8, 1.5)
