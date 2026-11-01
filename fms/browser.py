@@ -4575,22 +4575,35 @@ class PlaywrightDriver(BaseDriver):
     def _current_reel_state(self, page) -> dict | None:
         """Video state of the reel currently on screen, or None.
 
-        v0.2.180: the generic activity scroll never advanced past one
-        reel (250-700px wheel steps vs a full-viewport reel), so reels
-        get their own loop. Prefers the playing video; falls back to
-        any video with a finite duration.
+        v0.2.182: the old finder (first playing video, else first
+        video with a duration) could grab a previous reel's ENDED
+        video lingering in the page while the new reel buffered —
+        the loop then 'finished' it in ~1.5s and scrolled, the
+        user-verified 1-2s symptom. Now only the MOST VISIBLE
+        video counts: the largest visible area inside the viewport
+        (the active reel fills the centre; offscreen/preloaded
+        videos have zero or tiny visible area and are ignored),
+        whether it is playing or still buffering.
         """
         try:
             state = page.evaluate("""() => {
-                const vids = [...document.querySelectorAll('video')];
-                const v = vids.find(v => !v.paused && v.duration
-                    && isFinite(v.duration) && v.duration > 0)
-                    || vids.find(v => v.duration
-                    && isFinite(v.duration) && v.duration > 0);
-                if (!v) return null;
-                return {src: v.currentSrc || v.src || '',
-                        t: v.currentTime, d: v.duration,
-                        ended: v.ended, paused: v.paused};
+                const vw = window.innerWidth, vh = window.innerHeight;
+                let best = null, bestArea = 0;
+                for (const v of document.querySelectorAll('video')) {
+                    if (!v.duration || !isFinite(v.duration)
+                        || v.duration <= 0) continue;
+                    const r = v.getBoundingClientRect();
+                    const w = Math.max(0, Math.min(r.right, vw)
+                        - Math.max(r.left, 0));
+                    const h = Math.max(0, Math.min(r.bottom, vh)
+                        - Math.max(r.top, 0));
+                    const area = w * h;
+                    if (area > bestArea) { bestArea = area; best = v; }
+                }
+                if (!best || bestArea <= 0) return null;
+                return {src: best.currentSrc || best.src || '',
+                        t: best.currentTime, d: best.duration,
+                        ended: best.ended, paused: best.paused};
             }""")
         except Exception:
             return None
@@ -4630,14 +4643,26 @@ class PlaywrightDriver(BaseDriver):
             time.sleep(settle)
 
     def _wait_for_reel(self, page, end: float) -> dict | None:
-        """Wait up to 5s (bounded by the block end) for a video reel."""
+        """Wait up to 5s (bounded by the block end) for a video reel.
+
+        v0.2.182: a state that is already ended (or within 0.5s of
+        the end) at first sight is NOT counted at once — the loop
+        keeps polling for a fresh playing state (a looping reel
+        restarts, a reused element loads its new clip, a buffering
+        reel starts). Only if none appears by the deadline is the
+        last seen state returned, so a genuinely finished reel still
+        advances instead of stalling.
+        """
         deadline = min(end, time.time() + 5.0)
+        last: dict | None = None
         while time.time() < deadline:
             state = self._current_reel_state(page)
             if state is not None:
-                return state
+                last = state
+                if not state["ended"] and state["t"] < state["d"] - 0.5:
+                    return state
             time.sleep(0.5)
-        return self._current_reel_state(page)
+        return last if last is not None else self._current_reel_state(page)
 
     def _watch_reels_loop(self, minutes: float) -> None:
         """Watch reels one at a time until the block's total time ends.
