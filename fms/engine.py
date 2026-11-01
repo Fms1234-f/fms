@@ -877,6 +877,39 @@ class RunController:
         )
         return row["c"] if row else 0
 
+    def _run_account_in_fresh_thread(self, account: dict, quota: int,
+                                     account_idx: int) -> str:
+        """Run one account on a fresh thread; return _process_account's outcome.
+
+        v0.2.179: Playwright's sync API allows only one live loop per
+        thread. An account whose driver is left open (keep_open, or a
+        failure whose browser stays open for inspection) leaves its
+        loop alive in the worker thread, so the NEXT account's
+        sync_playwright().start() in that same thread raises 'Sync API
+        inside the asyncio loop' before any browser opens. A fresh
+        thread per account gives every account a clean loop; a
+        keep_open browser stays open exactly as before (its thread is
+        gone, like workers at run end today). Exceptions propagate so
+        the worker's handling is unchanged.
+        """
+        box: dict = {}
+
+        def _target() -> None:
+            try:
+                box["outcome"] = self._process_account(account, quota, account_idx)
+            except Exception as exc:  # noqa: BLE001 — re-raised below
+                box["error"] = exc
+
+        t = threading.Thread(
+            target=_target,
+            name=f"fms-run-{self.run_id}-acct-{account['id']}",
+            daemon=True)
+        t.start()
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box["outcome"]
+
     def _process_account(self, account: dict, quota: int, account_idx: int) -> str:
         """Process one account with retries (Retry Count Before Quitting).
 
@@ -2494,7 +2527,7 @@ class RunController:
                             self._acct_state[acc["id"]] = "failed"
                         return
                     try:
-                        outcome = self._process_account(
+                        outcome = self._run_account_in_fresh_thread(
                             acc, quotas_by_id[acc["id"]], acct_index[acc["id"]])
                     except Exception as exc:
                         # v0.2.35: one bad account must NEVER kill the worker
