@@ -3492,6 +3492,72 @@ class PlaywrightDriver(BaseDriver):
         except Exception:
             return False
 
+    def _relist_edit_price_in_tab(self, tab, listing_id: str,
+                                  direction: str, delta: float) -> dict:
+        """Shared Relist & Edit price step for an already-open edit-form
+        tab: wait until the form is usable, read the CURRENT price from
+        the form, write the direction/delta-adjusted price, click Update.
+        Never writes a price to a form that did not finish loading or
+        whose price could not be read. Callers own opening and closing
+        the tab, and turn unexpected exceptions into reason "error"."""
+        try:
+            tab.wait_for_load_state("load", timeout=30000)
+        except Exception:
+            pass
+        price_loc = S.to_playwright(tab, S.F_PRICE)
+        try:
+            price_loc.wait_for(state="visible", timeout=15000)
+        except Exception:
+            self._last_error = (f"Relist & Edit: edit form did not finish "
+                                f"loading for listing {listing_id}")
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "form_not_loaded"}
+        try:
+            raw = (price_loc.input_value() or "").strip()
+            current = float(raw.replace(",", "").replace("$", "")
+                            .replace("£", "").replace("€", ""))
+        except Exception:
+            self._last_error = (f"Relist & Edit: could not read the "
+                                f"current price for listing {listing_id}")
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "price_not_readable"}
+        try:
+            new_price = relist_edit_new_price(current, direction, delta)
+        except ValueError as exc:
+            self._last_error = f"Relist & Edit: {exc}"
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": current, "new_price": None,
+                    "reason": "bad_direction_or_delta"}
+        try:
+            price_loc.fill("")
+            self._type(price_loc, str(int(new_price))
+                       if float(new_price).is_integer() else str(new_price))
+        except Exception as exc:
+            self._last_error = (f"Relist & Edit: could not write the new "
+                                f"price for listing {listing_id}: {exc}")
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": current, "new_price": None,
+                    "reason": "price_write_failed"}
+        try:
+            update_loc = S.to_playwright(tab, S.F_RELIST_EDIT_UPDATE_BUTTON)
+            update_loc.wait_for(state="visible", timeout=15000)
+            human.human_click(tab, update_loc)
+        except Exception:
+            try:
+                human.human_click(tab, S.to_playwright(tab, S.F_SAVE_EDIT_BUTTON))
+            except Exception as exc:
+                self._last_error = (f"Relist & Edit: Update button not "
+                                    f"found for listing {listing_id}: {exc}")
+                return {"ok": False, "listing_id": listing_id,
+                        "current_price": current, "new_price": new_price,
+                        "reason": "update_button_not_found"}
+        human.human_pause(1500, 3000)
+        return {"ok": True, "listing_id": listing_id,
+                "current_price": current, "new_price": new_price,
+                "reason": None}
+
     def relist_edit_listing_price(self, listing_id: str, direction: str,
                                   delta: float) -> dict:
         """Relist & Edit (direct, one listing): open its edit form in a NEW
@@ -3499,70 +3565,117 @@ class PlaywrightDriver(BaseDriver):
         the form, write direction/delta-adjusted price, click Update.
         The tab is closed on success and on failure. Never writes a price
         to a form that did not finish loading or whose price could not
-        be read."""
+        be read. Kept only for drivers that do not implement the menu
+        path; the Relist & Edit engine prefers
+        relist_edit_listing_price_via_menu."""
         self._ensure()
         assert self._context is not None
         tab = self._context.new_page()
         try:
             tab.goto(S.MKT_EDIT_URL(listing_id),
                      wait_until="domcontentloaded", timeout=60000)
+            return self._relist_edit_price_in_tab(tab, listing_id,
+                                                  direction, delta)
+        except Exception as exc:
+            self._last_error = f"Relist & Edit failed for {listing_id}: {exc}"
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "error"}
+        finally:
             try:
-                tab.wait_for_load_state("load", timeout=30000)
+                tab.close()
             except Exception:
                 pass
-            price_loc = S.to_playwright(tab, S.F_PRICE)
+
+    def relist_edit_listing_price_via_menu(self, listing_id: str,
+                                           direction: str,
+                                           delta: float) -> dict:
+        """Relist & Edit (one listing) via the selling-page card menu —
+        the path the engine uses. The selling page (self._page) stays the
+        main page throughout; each listing's card is re-found on it at
+        that listing's turn, so no stale card is ever used. Steps: find
+        this listing's link, click the "..." button on the same card
+        (paired by card order), wait for the menu, read the menu's
+        "Edit listing" LINK, verify that link really belongs to this
+        listing, and open THAT link in a new tab — the faithful
+        automation equivalent of the user's right-click -> "Open link
+        in new tab" (the browser's native context menu is browser UI,
+        not page content, and cannot itself be clicked by automation).
+        The edit tab is then priced exactly as before and closed on
+        success and on failure. If the card, the "..." button, the menu,
+        or the "Edit listing" link cannot be found, or the link belongs
+        to a different listing, the listing is SKIPPED with a logged
+        reason, NO price is written, and the run continues with the
+        next listing. A menu-step skip NEVER falls back to the direct
+        edit URL — that would hide the very step the user asked for."""
+        self._ensure()
+        assert self._context is not None
+        page = self._page
+        assert page is not None
+
+        def _skip(reason):
+            self._last_error = (f"Relist & Edit: menu step failed for "
+                                f"listing {listing_id} ({reason})")
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": reason}
+
+        # 1. Re-find this listing's card on the selling page, at its turn.
+        try:
+            links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
+            handles = links_loc.all()
+        except Exception:
+            handles = []
+        idx = None
+        for i, handle in enumerate(handles):
             try:
-                price_loc.wait_for(state="visible", timeout=15000)
+                href = handle.get_attribute("href") or ""
             except Exception:
-                self._last_error = (f"Relist & Edit: edit form did not finish "
-                                    f"loading for listing {listing_id}")
-                return {"ok": False, "listing_id": listing_id,
-                        "current_price": None, "new_price": None,
-                        "reason": "form_not_loaded"}
-            try:
-                raw = (price_loc.input_value() or "").strip()
-                current = float(raw.replace(",", "").replace("$", "")
-                                .replace("£", "").replace("€", ""))
-            except Exception:
-                self._last_error = (f"Relist & Edit: could not read the "
-                                    f"current price for listing {listing_id}")
-                return {"ok": False, "listing_id": listing_id,
-                        "current_price": None, "new_price": None,
-                        "reason": "price_not_readable"}
-            try:
-                new_price = relist_edit_new_price(current, direction, delta)
-            except ValueError as exc:
-                self._last_error = f"Relist & Edit: {exc}"
-                return {"ok": False, "listing_id": listing_id,
-                        "current_price": current, "new_price": None,
-                        "reason": "bad_direction_or_delta"}
-            try:
-                price_loc.fill("")
-                self._type(price_loc, str(int(new_price))
-                           if float(new_price).is_integer() else str(new_price))
-            except Exception as exc:
-                self._last_error = (f"Relist & Edit: could not write the new "
-                                    f"price for listing {listing_id}: {exc}")
-                return {"ok": False, "listing_id": listing_id,
-                        "current_price": current, "new_price": None,
-                        "reason": "price_write_failed"}
-            try:
-                update_loc = S.to_playwright(tab, S.F_RELIST_EDIT_UPDATE_BUTTON)
-                update_loc.wait_for(state="visible", timeout=15000)
-                human.human_click(tab, update_loc)
-            except Exception:
-                try:
-                    human.human_click(tab, S.to_playwright(tab, S.F_SAVE_EDIT_BUTTON))
-                except Exception as exc:
-                    self._last_error = (f"Relist & Edit: Update button not "
-                                        f"found for listing {listing_id}: {exc}")
-                    return {"ok": False, "listing_id": listing_id,
-                            "current_price": current, "new_price": new_price,
-                            "reason": "update_button_not_found"}
-            human.human_pause(1500, 3000)
-            return {"ok": True, "listing_id": listing_id,
-                    "current_price": current, "new_price": new_price,
-                    "reason": None}
+                continue
+            if (f"/marketplace/item/{listing_id}/" in href
+                    or href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+                    == str(listing_id)):
+                idx = i
+                break
+        if idx is None:
+            return _skip("card_not_found")
+        try:
+            links_loc.nth(idx).wait_for(state="visible", timeout=15000)
+        except Exception:
+            return _skip("card_not_found")
+        # 2. That card's "..." button (one per card, same page order).
+        try:
+            buttons = page.locator(
+                S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
+        except Exception:
+            buttons = []
+        if idx >= len(buttons):
+            return _skip("menu_button_not_found")
+        try:
+            human.human_click(page, buttons[idx])
+        except Exception:
+            return _skip("menu_button_not_found")
+        # 3. The menu's "Edit listing" link, verified against this listing.
+        edit_loc = S.to_playwright(page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
+        try:
+            edit_loc.wait_for(state="visible", timeout=15000)
+        except Exception:
+            return _skip("edit_menu_not_found")
+        try:
+            href = edit_loc.get_attribute("href") or ""
+        except Exception:
+            href = ""
+        if not href:
+            return _skip("edit_link_not_found")
+        if str(listing_id) not in href:
+            return _skip("edit_link_mismatch")
+        edit_url = (href if href.startswith("http")
+                    else "https://www.facebook.com" + href)
+        tab = self._context.new_page()
+        try:
+            tab.goto(edit_url, wait_until="domcontentloaded", timeout=60000)
+            return self._relist_edit_price_in_tab(tab, listing_id,
+                                                  direction, delta)
         except Exception as exc:
             self._last_error = f"Relist & Edit failed for {listing_id}: {exc}"
             return {"ok": False, "listing_id": listing_id,
@@ -5073,6 +5186,7 @@ class MockDriver(BaseDriver):
     fake_take_action: list[dict] = []  # get_take_action_listings() returns this
     fake_relist_edit_prices: dict[str, float] = {}  # listing_id -> current price
     fake_relist_edit_not_loaded: set[str] = set()  # forms that never load
+    fake_relist_edit_menu_missing: set[str] = set()  # menu step fails
 
     def __init__(self, account: dict):
         super().__init__(account)
@@ -5093,6 +5207,7 @@ class MockDriver(BaseDriver):
             cls.fake_draft_count = 2
             cls.fake_relist_edit_prices = {}
             cls.fake_relist_edit_not_loaded = set()
+            cls.fake_relist_edit_menu_missing = set()
             cls._draft_seq = 0
             cls._tab_seq = 0
 
@@ -5327,6 +5442,34 @@ class MockDriver(BaseDriver):
         return {"ok": True, "listing_id": listing_id,
                 "current_price": current, "new_price": new_price,
                 "reason": None}
+
+    def relist_edit_listing_price_via_menu(self, listing_id: str,
+                                           direction: str,
+                                           delta: float) -> dict:
+        """Mock Relist & Edit menu path: same price logic as
+        relist_edit_listing_price, but the event is marked via_menu so
+        tests can prove the engine used the menu path. Listings in
+        fake_relist_edit_menu_missing simulate a failed menu step —
+        skipped with reason menu_button_not_found, no price written,
+        never a silent direct-URL fallback."""
+        if listing_id in getattr(type(self),
+                                 "fake_relist_edit_menu_missing", set()):
+            self._record("relist_edit_price_skipped", listing_id=listing_id,
+                         reason="menu_button_not_found", via_menu=True)
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "menu_button_not_found"}
+        res = self.relist_edit_listing_price(listing_id, direction, delta)
+        # Re-mark the recorded event as the menu path (same event name
+        # and fields, so worker-level assertions still hold).
+        if res.get("ok"):
+            for call in reversed(type(self).calls):
+                if (call["event"] == "relist_edit_price"
+                        and call["listing_id"] == listing_id
+                        and "via_menu" not in call):
+                    call["via_menu"] = True
+                    break
+        return res
 
     def scrape_listing(self, url: str) -> dict | None:
         data = type(self).fake_scrapes.get(url)

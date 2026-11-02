@@ -30,6 +30,15 @@ Covers the user-confirmed 2026-11-02 design, nothing else:
      links reported empty only after the bound); engine doubles prove
      the flow prefers the scoped helper and keeps first-listing order
      and Min/Max count.
+  9. Card-menu navigation (2026-11-02, Relist & Edit ONLY): the edit
+     form is reached through the selling-page card's "..." menu
+     ("Edit listing" opened in a new tab), not by a direct edit URL.
+     The browser's native right-click menu cannot be clicked by
+     automation, so the faithful equivalent is used and disclosed: the
+     menu's "Edit listing" LINK is opened in a new tab. A menu-step
+     failure skips that listing (no price written, no silent direct-URL
+     fallback) and the next listing is still processed; the menu link
+     is verified to belong to the listing being edited.
 No live Facebook is involved anywhere in this file.
 """
 import os
@@ -600,3 +609,310 @@ def test_api_and_runs_page_do_not_require_products_for_relist_edit():
     modes_line = [ln for ln in runs_src.splitlines()
                   if ln.strip().startswith("const POSTING_MODES")][0]
     assert "relist_edit" not in modes_line
+
+
+# --------------------------------------------- card-menu navigation ---
+class _FakeMenuLinkHandle:
+    def __init__(self, href):
+        self._href = href
+
+    def get_attribute(self, name):
+        return self._href if name == "href" else None
+
+    def inner_text(self):
+        return ""
+
+
+class _FakeMenuNth:
+    def wait_for(self, state=None, timeout=None):
+        return None
+
+
+class _FakeMenuLinks:
+    def __init__(self, page):
+        self._page = page
+
+    def all(self):
+        return [_FakeMenuLinkHandle(h) for h in self._page.card_hrefs]
+
+    def nth(self, idx):
+        return _FakeMenuNth()
+
+
+class _FakeMenuButton:
+    def __init__(self, page, index):
+        self._page = page
+        self._index = index
+
+    def scroll_into_view_if_needed(self, timeout=None):
+        pass
+
+    def bounding_box(self):
+        return None
+
+    def click(self, delay=None, timeout=None):
+        self._page.menu_clicks.append(self._index)
+        if self._page.menu_opens:
+            self._page.menu_open_index = self._index
+
+
+class _FakeMenuButtons:
+    def __init__(self, page):
+        self._page = page
+
+    def all(self):
+        if self._page.buttons_missing:
+            return []
+        return [_FakeMenuButton(self._page, i)
+                for i in range(len(self._page.cards))]
+
+
+class _FakeMenuEditLocator:
+    def __init__(self, page):
+        self._page = page
+
+    def wait_for(self, state=None, timeout=None):
+        if (not self._page.edit_link_present
+                or self._page.menu_open_index is None):
+            raise RuntimeError("menu / Edit listing not visible")
+
+    def get_attribute(self, name):
+        if name != "href" or self._page.menu_open_index is None:
+            return None
+        if self._page.edit_href_none:
+            return None
+        return self._page.edit_hrefs[self._page.menu_open_index]
+
+
+class _FakeMenuEditCollection:
+    def __init__(self, page):
+        self._page = page
+
+    @property
+    def first(self):
+        return _FakeMenuEditLocator(self._page)
+
+
+class _FakeMenuPage:
+    """Selling page: one card per listing, one "..." button per card.
+
+    card_hrefs are the listing links; edit_hrefs are the menu's
+    "Edit listing" destinations, in the same card order."""
+
+    def __init__(self, card_hrefs, edit_hrefs, buttons_missing=False,
+                 menu_opens=True, edit_link_present=True,
+                 edit_href_none=False):
+        self.cards = list(card_hrefs)
+        self.card_hrefs = list(card_hrefs)
+        self.edit_hrefs = list(edit_hrefs)
+        self.buttons_missing = buttons_missing
+        self.menu_opens = menu_opens
+        self.edit_link_present = edit_link_present
+        self.edit_href_none = edit_href_none
+        self.menu_clicks = []
+        self.menu_open_index = None
+
+    def locator(self, sel):
+        if "/marketplace/item/" in sel:
+            return _FakeMenuLinks(self)
+        if "..." in sel:
+            return _FakeMenuButtons(self)
+        if "Edit listing" in sel:
+            return _FakeMenuEditCollection(self)
+        raise AssertionError(f"unexpected selector {sel!r}")
+
+
+class _FakeMenuContext:
+    def __init__(self, tabs):
+        self.tabs = tabs
+        self.new_pages = 0
+
+    def new_page(self):
+        tab = self.tabs[self.new_pages]
+        self.new_pages += 1
+        return tab
+
+
+def _make_menu_driver(page, tabs, monkeypatch):
+    drv = _make_playwright_driver(tabs[0] if tabs else _FakeTab(),
+                                  monkeypatch)
+    drv._page = page
+    drv._context = _FakeMenuContext(tabs)
+    return drv
+
+
+def _menu_page():
+    # Menu destinations deliberately carry an extra marker so the test
+    # can prove the tab opened the MENU link, not a URL built from id.
+    return _FakeMenuPage(
+        ["https://www.facebook.com/marketplace/item/L1/",
+         "https://www.facebook.com/marketplace/item/L2/"],
+        [EDIT_URL + "L1&from_menu=1", EDIT_URL + "L2&from_menu=1"])
+
+
+def test_playwright_menu_flow_opens_menu_link_in_new_tab(monkeypatch):
+    page = _menu_page()
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is True
+    assert res["current_price"] == 100.0 and res["new_price"] == 97.0
+    # The tab opened the menu link's destination (marker proves it came
+    # from the menu, not from an edit URL built from the id).
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert tab.fills == ["", "97"], "old price cleared, new price written"
+    assert tab.clicks == ["update"], "Update clicked"
+    assert tab.closed is True
+    assert page.menu_clicks == [0], "first card's ... button clicked"
+
+
+def test_playwright_menu_missing_button_skips_without_tab(monkeypatch):
+    page = _menu_page()
+    page.buttons_missing = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "menu_button_not_found"
+    assert drv._context.new_pages == 0, "no edit tab opened"
+    assert tab.fills == [] and tab.clicks == []
+
+
+def test_playwright_menu_not_opening_skips_without_tab(monkeypatch):
+    page = _menu_page()
+    page.menu_opens = False
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "edit_menu_not_found"
+    assert drv._context.new_pages == 0
+
+
+def test_playwright_menu_missing_edit_link_skips_without_tab(monkeypatch):
+    page = _menu_page()
+    page.edit_link_present = False
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "edit_menu_not_found"
+    assert drv._context.new_pages == 0
+
+
+def test_playwright_menu_edit_link_without_href_skips(monkeypatch):
+    page = _menu_page()
+    page.edit_href_none = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "edit_link_not_found"
+    assert drv._context.new_pages == 0
+
+
+def test_playwright_menu_edit_link_mismatch_skips_without_tab(monkeypatch):
+    page = _menu_page()
+    # First card's menu points at a DIFFERENT listing: must never edit
+    # the wrong listing, and must not fall back to the direct URL.
+    page.edit_hrefs = [EDIT_URL + "L2&from_menu=1",
+                       EDIT_URL + "L2&from_menu=1"]
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "edit_link_mismatch"
+    assert drv._context.new_pages == 0, "no tab, no silent direct fallback"
+    assert tab.fills == []
+
+
+def test_playwright_menu_second_listing_after_first_tab_closes(monkeypatch):
+    page = _menu_page()
+    tab1 = _FakeTab(price_value="100")
+    tab2 = _FakeTab(price_value="50")
+    drv = _make_menu_driver(page, [tab1, tab2], monkeypatch)
+    res1 = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    res2 = drv.relist_edit_listing_price_via_menu("L2", "ascending", 2)
+    assert res1["new_price"] == 97.0 and res2["new_price"] == 52.0
+    assert page.menu_clicks == [0, 1], "cards re-found in order, per turn"
+    assert tab1.closed is True and tab2.closed is True
+    assert tab1.gotos == [EDIT_URL + "L1&from_menu=1"]
+    assert tab2.gotos == [EDIT_URL + "L2&from_menu=1"]
+
+
+def test_playwright_menu_card_not_found_skips(monkeypatch):
+    page = _menu_page()
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("L9", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "card_not_found"
+    assert drv._context.new_pages == 0
+
+
+class _MenuFakeDriver(FakeDriver):
+    """FakeDriver whose price edits go through the menu path."""
+
+    def __init__(self, listings, prices, menu_missing=(), not_loaded=()):
+        super().__init__(listings, prices, not_loaded)
+        self.menu_missing = set(menu_missing)
+
+    def relist_edit_listing_price_via_menu(self, listing_id, direction,
+                                           delta):
+        self.events.append(("menu_edit", listing_id))
+        if listing_id in self.menu_missing:
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "menu_button_not_found"}
+        return self.relist_edit_listing_price(listing_id, direction, delta)
+
+
+def test_engine_prefers_menu_path_and_keeps_count_direction_clamp():
+    drv = _MenuFakeDriver([{"id": "L1"}, {"id": "L2"}],
+                          {"L1": 2.0, "L2": 100.0})
+    ctl = make_controller(2, 2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert ("menu_edit", "L1") in drv.events
+    assert ("menu_edit", "L2") in drv.events
+    # Descending 3 from 2 clamps at 1; L2: 100 -> 97.
+    assert drv.writes == [("L1", 2.0, 1.0), ("L2", 100.0, 97.0)]
+
+
+def test_engine_menu_skip_continues_to_next_listing():
+    drv = _MenuFakeDriver([{"id": "L1"}, {"id": "L2"}],
+                          {"L1": 100.0, "L2": 50.0},
+                          menu_missing={"L1"})
+    ctl = make_controller(2, 2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == [("L2", 50.0, 47.0)], "L1 skipped, L2 still edited"
+    assert any("skipped L1 (menu_button_not_found)" in m for m in ctl.logs)
+    assert any("edited 1/2" in m for m in ctl.logs)
+
+
+def test_mock_driver_via_menu_records_menu_path_and_skip():
+    MockDriver.reset()
+    MockDriver.fake_relist_edit_prices = {"L1": 100.0, "L2": 50.0}
+    MockDriver.fake_relist_edit_menu_missing = {"L2"}
+    mock = MockDriver({"label": "Acct"})
+    res = mock.relist_edit_listing_price_via_menu("L1", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert [c for c in MockDriver.calls
+            if c["event"] == "relist_edit_price"
+            and c["listing_id"] == "L1" and c.get("via_menu")], \
+        "menu path must be recorded as such"
+    res = mock.relist_edit_listing_price_via_menu("L2", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "menu_button_not_found"
+    assert [c for c in MockDriver.calls
+            if c["event"] == "relist_edit_price"
+            and c["listing_id"] == "L2"] == [], "no price write for L2"
+    MockDriver.reset()
+
+
+def test_menu_path_lives_only_in_relist_edit_direct_flow():
+    src = (ROOT / "browser.py").read_text(encoding="utf-8")
+    assert "def relist_edit_listing_price_via_menu" in src
+    assert "def relist_edit_listing_price" in src
+    # The shared listing reader keeps its name and callers elsewhere.
+    assert "def get_my_listings" in src
+    eng = (ROOT / "engine.py").read_text(encoding="utf-8")
+    segment = eng.split("def _relist_edit_direct_flow")[1] \
+        .split("def _renew_listing_1_flow")[0]
+    assert "relist_edit_listing_price_via_menu" in segment
+    sel = (ROOT / "selectors.py").read_text(encoding="utf-8")
+    assert "F_RELIST_EDIT_CARD_MENU_BUTTON" in sel
+    assert "F_RELIST_EDIT_MENU_EDIT_LINK" in sel
+    assert "Edit listing" in sel

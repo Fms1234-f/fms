@@ -167,6 +167,19 @@ F_SAVE_EDIT_BUTTON = ("css", "div[aria-label='Save'][role='button'], "
 # "Update" (the create form uses "Save"). Tried first, Save is the fallback.
 F_RELIST_EDIT_UPDATE_BUTTON = ("css", "div[aria-label='Update'][role='button'], "
                                    "button:has-text('Update')")
+# Relist & Edit ONLY (2026-11-02): reach the edit form through the
+# selling-page card's "..." menu, exactly as the user does by hand.
+# The "..." button sits on the same card as the listing link, and the
+# menu's "Edit listing" entry is a link. Automation cannot click the
+# browser's native right-click context menu (browser UI, not page
+# content), so the faithful equivalent is used: click "...", find the
+# menu's "Edit listing" LINK, and open THAT link's destination in a new
+# tab — the same edit form, in a new tab, reached through the menu, not
+# by constructing an edit URL from the listing id.
+F_RELIST_EDIT_CARD_MENU_BUTTON = ("css", "div[role='button']:has-text('...'), "
+                                        "button:has-text('...')")
+F_RELIST_EDIT_MENU_EDIT_LINK = ("css", "a:has-text('Edit listing'), "
+                                     "[role='menuitem']:has-text('Edit listing')")
 
 # ------------------------------------------------- scrap (read-only) ---
 # Best-effort selectors for extracting a listing's public data.

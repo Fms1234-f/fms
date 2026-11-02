@@ -2291,6 +2291,14 @@ class RunController:
         trusting the short pause in the shared get_my_listings(). Drivers
         without that method fall back to get_my_listings(). No other
         action uses this wait, and the shared method is unchanged.
+        Menu navigation (2026-11-02, Relist & Edit ONLY): each listing's
+        edit form is reached through its selling-page card's "..." menu
+        ("Edit listing" opened in a new tab), not by a direct edit URL.
+        Drivers with relist_edit_listing_price_via_menu are used for
+        this; drivers without it (older test doubles) fall back to the
+        direct method. A menu-step failure for a listing is a skip, NOT
+        a silent direct-URL retry — the menu method itself returns the
+        skip, and the flow never re-runs a failed listing directly.
         A listing whose form never loads is skipped (no price written) and
         the run continues with the next listing; the account still ends
         Done. Returning without raising lets the worker close the browser
@@ -2306,7 +2314,14 @@ class RunController:
         lo = max(1, int(self.cfg.relist_edit_min_count or 1))
         hi = max(lo, int(self.cfg.relist_edit_max_count or lo))
         want = random.randint(lo, hi)
-        method = getattr(driver, "relist_edit_listing_price", None)
+        # Relist & Edit ONLY: prefer the card-menu path; drivers without
+        # it (older test doubles) use the direct method. A menu-step
+        # failure is handled inside the menu method as a skip — the flow
+        # below never retries a skipped listing directly.
+        menu_method = getattr(driver, "relist_edit_listing_price_via_menu",
+                              None)
+        method = (menu_method if callable(menu_method)
+                  else getattr(driver, "relist_edit_listing_price", None))
         if not callable(method):
             self.log(f"[{label}] Relist & Edit requires a price-edit-capable browser driver",
                      level="error", account_id=account["id"])
