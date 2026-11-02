@@ -29,6 +29,8 @@
         </div>
       </div>
     </span>
+    <span class="cc-field"><button type="button" class="speedbtn" id="speedBtn" onclick="cycleSpeed()" title="Run speed">⚡1x</button>
+      <input type="hidden" id="speedVal" value="1"></span>
 
   </div>
   <div class="cc-row">
@@ -44,8 +46,6 @@
       <input type="datetime-local" id="schedAt">
     </span>
     <span class="cc-field"><label class="check"><input type="checkbox" id="activeOnly" checked> Active Accounts</label></span>
-    <span class="cc-field"><button type="button" class="speedbtn" id="speedBtn" onclick="cycleSpeed()" title="Run speed">⚡1x</button>
-      <input type="hidden" id="speedVal" value="1"></span>
   </div>
   <!-- v0.2.50: Min/Max dialog — appears when Start is pressed. -->
   <div id="minmaxDlg" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:200;background:rgba(0,0,0,.45);align-items:center;justify-content:center">
