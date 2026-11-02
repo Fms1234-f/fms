@@ -166,8 +166,10 @@ async function startRun(){
   if(!actVal){ fmsAlert('Pehle Script box se koi Action ya Script select karein.'); return; }
   // Scripts carry their own blocks (Post counts, durations) — the
   // Min/Max dialog has no role in a script run, so skip it and start
-  // directly. Every other action still shows the dialog as before.
-  if(actVal.startsWith('script:')){
+  // directly. Login also starts directly (v0.2.183, user-approved):
+  // it has no listings or prices to configure. Every other action
+  // still shows the dialog as before.
+  if(actVal.startsWith('script:') || actVal === 'login'){
     await _doStartRun();
     return;
   }

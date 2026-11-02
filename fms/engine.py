@@ -916,7 +916,12 @@ class RunController:
         Returns 'done', 'failed', 'login_failed' or 'stopped' (v0.2.23).
         """
         label = account["label"]
-        attempts = 1 + max(0, int(self.cfg.retry_count))
+        # v0.2.183 (user-approved): Login mode never retries — one
+        # attempt's outcome is final (success -> Done, any failure ->
+        # Failed with the browser left open), so one stuck browser
+        # can never hold up the queue. Every other mode retries as before.
+        attempts = (1 if self.cfg.mode == "login"
+                    else 1 + max(0, int(self.cfg.retry_count)))
         for attempt in range(1, attempts + 1):
             try:
                 driver = self.driver_factory(_driver_creds(self.db, self.cfg,
@@ -975,6 +980,13 @@ class RunController:
                              f"attempt(s): {reason}",
                              level="error", account_id=account["id"])
                     self._log_account_summary(account, quota)
+                    # v0.2.183 (Login mode only): leave the browser open
+                    # on failure (captcha / security check / wrong
+                    # credentials) so the user can inspect or solve it
+                    # manually — mark failed BEFORE finally, like the
+                    # browser-closed path. Other modes keep closing it.
+                    if self.cfg.mode == "login":
+                        self._acct_state[account["id"]] = "failed"
                     return "login_failed"
                 self.log(f"[{label}] login failed "
                          f"(attempt {attempt}/{attempts}) — retrying",
@@ -1081,7 +1093,13 @@ class RunController:
         elif mode == "renew_listing_1":
             self._renew_listing_1_flow(account, driver, quota)
         elif mode == "login":
-            self.log(f"[{label}] login verified — no posting in Login mode",
+            # v0.2.183 (user-approved): prove the feed, then Done. The
+            # worker auto-closes the browser on success (no keep_open).
+            # A failed feed navigation raises -> Failed, browser left
+            # open (generic-exception path marks failed before finally).
+            driver.open_url("https://www.facebook.com/")
+            self.log(f"[{label}] login verified — feed opened, no posting "
+                     f"in Login mode",
                      account_id=account["id"])
         elif mode == "download_images_titles":
             self._download_assets_flow(account, driver)
