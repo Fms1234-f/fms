@@ -21,6 +21,15 @@ Covers the user-confirmed 2026-11-02 design, nothing else:
   7. Source guards: dialog branch, API + engine fields, and
      relist_edit NOT requiring products (engine POSTING_MODES and the
      runs-page product-tick list).
+  8. Selling-page wait (2026-11-02, Relist & Edit ONLY): the direct flow
+     reads listings through the Relist & Edit-scoped helper, which waits
+     until at least one listing link is actually visible (up to 30s on
+     the real driver) before reading. The shared get_my_listings() is
+     untouched, so no other action gains or loses this wait. Fake-page
+     tests prove the polling itself (late links found, never-visible
+     links reported empty only after the bound); engine doubles prove
+     the flow prefers the scoped helper and keeps first-listing order
+     and Min/Max count.
 No live Facebook is involved anywhere in this file.
 """
 import os
@@ -393,6 +402,171 @@ def test_playwright_fake_page_update_falls_back_to_save(monkeypatch):
     res = drv.relist_edit_listing_price("L1", "ascending", 2)
     assert res["ok"] is True and res["new_price"] == 52.0
     assert tab.clicks == ["save"], "Save used only when Update is absent"
+
+
+# --------------------------------------------- selling-page wait -----
+class _FakeSellingLink:
+    def __init__(self, href, title):
+        self._href = href
+        self._title = title
+
+    def get_attribute(self, name):
+        return self._href if name == "href" else None
+
+    def inner_text(self):
+        return self._title
+
+
+class _FakeSellingFirst:
+    """wait_for() that fails until the page 'shows' its listings."""
+
+    def __init__(self, page):
+        self._page = page
+
+    def wait_for(self, state=None, timeout=None):
+        self._page.wait_attempts += 1
+        if self._page.wait_attempts <= self._page.fail_wait_attempts:
+            raise RuntimeError("listing not visible yet")
+
+
+class _FakeSellingLocator:
+    def __init__(self, page):
+        self._page = page
+
+    @property
+    def first(self):
+        return _FakeSellingFirst(self._page)
+
+    def all(self):
+        return list(self._page.links)
+
+
+class _FakeSellingPage:
+    def __init__(self, links, fail_wait_attempts=0):
+        self.links = links
+        self.fail_wait_attempts = fail_wait_attempts
+        self.wait_attempts = 0
+        self.gotos = []
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.gotos.append(url)
+
+    def locator(self, sel):
+        return _FakeSellingLocator(self)
+
+
+def _make_selling_driver(page, monkeypatch):
+    drv = _make_playwright_driver(_FakeTab(), monkeypatch)
+    drv._page = page
+    return drv
+
+
+def test_playwright_selling_page_late_links_found_in_order(monkeypatch):
+    # Listings appear only after 3 failed visibility polls — after the
+    # old 2-3.5s pause would already have given up and read nothing.
+    page = _FakeSellingPage(
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "First"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Second")],
+        fail_wait_attempts=3)
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111", "222"], out
+    assert page.gotos == [SELLING_URL]
+    assert page.wait_attempts == 4, "3 failed polls + 1 successful poll"
+
+
+def test_playwright_selling_page_visible_at_once(monkeypatch):
+    page = _FakeSellingPage(
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "Only")])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111"]
+    assert page.wait_attempts == 1, "no extra waiting once visible"
+
+
+def test_playwright_selling_page_never_visible_empty_only_after_bound(monkeypatch):
+    page = _FakeSellingPage([], fail_wait_attempts=10 ** 9)
+    drv = _make_selling_driver(page, monkeypatch)
+    start = time.time()
+    # Small bound keeps the test fast; the production default is 30s.
+    out = drv.relist_edit_get_selling_listings(timeout_s=0.3)
+    elapsed = time.time() - start
+    assert out == []
+    assert elapsed >= 0.3, f"gave up after {elapsed:.2f}s, before the bound"
+    assert page.gotos == [SELLING_URL]
+
+
+class _ScopedFakeDriver(FakeDriver):
+    """FakeDriver plus the Relist & Edit-scoped selling-page read.
+
+    get_my_listings() deliberately returns a DIFFERENT list, so the test
+    proves the engine uses the scoped helper and never the shared one.
+    The scoped method simulates the visible-wait (records wait polls)
+    rather than timing a real page; the real polling is proved by the
+    fake-page tests above."""
+
+    def __init__(self, listings, prices, not_loaded=()):
+        super().__init__(listings, prices, not_loaded)
+        self.wait_polls = 0
+
+    def get_my_listings(self):
+        self.events.append(("get_my_listings_SHARED",))
+        return [{"id": "WRONG", "title": "must not be edited"}]
+
+    def relist_edit_get_selling_listings(self):
+        self.wait_polls = 5  # simulated: listings visible on the 5th poll
+        self.events.append(("relist_edit_selling_listings",))
+        return [dict(x) for x in self.listings]
+
+
+def test_engine_uses_scoped_selling_read_not_shared_listings():
+    drv = _ScopedFakeDriver([{"id": "L1"}, {"id": "L2"}],
+                            {"L1": 100.0, "L2": 200.0})
+    ctl = make_controller(2, 2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == [("L1", 100.0, 97.0), ("L2", 200.0, 197.0)]
+    assert ("relist_edit_selling_listings",) in drv.events
+    assert "WRONG" not in [w[0] for w in drv.writes]
+
+
+def test_engine_scoped_read_keeps_first_listing_and_min_max():
+    drv = _ScopedFakeDriver([{"id": "L1"}, {"id": "L2"}, {"id": "L3"}],
+                            {"L1": 10.0, "L2": 20.0, "L3": 30.0})
+    ctl = make_controller(1, 1)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == [("L1", 10.0, 7.0)], "first listing, count 1"
+
+
+class _NeverVisibleScopedDriver(_ScopedFakeDriver):
+    def relist_edit_get_selling_listings(self):
+        # Simulates the full bound expiring with nothing visible.
+        time.sleep(0.2)
+        self.events.append(("relist_edit_selling_listings",))
+        return []
+
+
+def test_engine_never_visible_listings_is_done_after_wait_not_instant():
+    drv = _NeverVisibleScopedDriver([], {})
+    ctl = make_controller(1, 3)
+    start = time.time()
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert time.time() - start >= 0.2
+    assert drv.writes == []
+    assert any("No selling listings available" in m for m in ctl.logs)
+
+
+def test_scoped_wait_lives_only_in_relist_edit_direct_flow():
+    src = (ROOT / "browser.py").read_text(encoding="utf-8")
+    assert "def relist_edit_get_selling_listings" in src
+    eng = (ROOT / "engine.py").read_text(encoding="utf-8")
+    segment = eng.split("def _relist_edit_direct_flow")[1] \
+        .split("def _renew_listing_1_flow")[0]
+    assert "relist_edit_get_selling_listings" in segment
+    # The shared method keeps its old name and callers elsewhere.
+    assert "def get_my_listings" in src
 
 
 # ------------------------------------------------------- source guards ---

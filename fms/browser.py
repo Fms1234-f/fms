@@ -3394,6 +3394,59 @@ class PlaywrightDriver(BaseDriver):
             pass
         return out
 
+    def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
+        """Relist & Edit ONLY: read the selling page, but wait first until
+        at least one listing link is actually VISIBLE, polling up to
+        timeout_s seconds (default 30). This is the selling-page wait the
+        user asked for on 2026-11-02; it is used ONLY by the Relist & Edit
+        direct flow. The shared get_my_listings() is deliberately NOT
+        changed, because other actions (legacy Delete & Relist, Relist,
+        script blocks, delete-duplicates) also call it and must keep their
+        old behaviour. Same link parsing, order and 50 cap as
+        get_my_listings(); a page with nothing visible by the deadline is
+        reported as empty (never a crash)."""
+        self._ensure()
+        page = self._page
+        assert page is not None
+        out: list[dict] = []
+        try:
+            page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
+            links = page.locator(S.SCR_MY_LISTING_LINKS[1])
+            deadline = time.time() + max(0.0, float(timeout_s))
+            visible = False
+            while time.time() < deadline:
+                try:
+                    remaining_ms = max(1, int((deadline - time.time()) * 1000))
+                    links.first.wait_for(state="visible",
+                                         timeout=min(1000, remaining_ms))
+                    visible = True
+                    break
+                except Exception:
+                    if time.time() >= deadline:
+                        break
+                    continue
+            if not visible:
+                return []
+            seen: set[str] = set()
+            for link in links.all()[:50]:
+                try:
+                    href = link.get_attribute("href") or ""
+                except Exception:
+                    continue
+                if "/marketplace/item/" not in href:
+                    continue
+                lid = href.rstrip("/").split("/")[-1].split("?")[0]
+                if lid and lid not in seen:
+                    seen.add(lid)
+                    try:
+                        title = (link.inner_text() or "").strip()[:120]
+                    except Exception:
+                        title = ""
+                    out.append({"id": lid, "title": title})
+        except Exception:
+            pass
+        return out
+
     def edit_listing(self, listing_id: str, payload: dict) -> bool:
         """Open the Edit page and rewrite title/price/category/description."""
         self._ensure()
@@ -5230,6 +5283,15 @@ class MockDriver(BaseDriver):
 
     def get_my_listings(self) -> list[dict]:
         self._record("get_my_listings", count=len(type(self).fake_listings))
+        return [dict(x) for x in type(self).fake_listings]
+
+    def relist_edit_get_selling_listings(self) -> list[dict]:
+        """Mock Relist & Edit selling-page read: the Relist & Edit direct
+        flow uses this (not the shared get_my_listings) so its visible-
+        listing wait is scoped to that action only. The mock page is
+        already 'loaded', so it returns the fake listings at once."""
+        self._record("relist_edit_selling_listings",
+                     count=len(type(self).fake_listings))
         return [dict(x) for x in type(self).fake_listings]
 
     def edit_listing(self, listing_id: str, payload: dict) -> bool:

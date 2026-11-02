@@ -2284,6 +2284,13 @@ class RunController:
         form, new price = current +/- delta (clamped at 1), price written,
         Update clicked, repeat until the Min-Max count for this account is
         done. No product dataset is used; the selling page is the source.
+        Selling-page wait (2026-11-02, Relist & Edit ONLY): before reading
+        listings, the flow uses the driver's Relist & Edit-scoped
+        relist_edit_get_selling_listings(), which waits until at least
+        one listing is actually visible (up to 30 seconds) instead of
+        trusting the short pause in the shared get_my_listings(). Drivers
+        without that method fall back to get_my_listings(). No other
+        action uses this wait, and the shared method is unchanged.
         A listing whose form never loads is skipped (no price written) and
         the run continues with the next listing; the account still ends
         Done. Returning without raising lets the worker close the browser
@@ -2307,7 +2314,13 @@ class RunController:
         driver.open_url("https://www.facebook.com/")
         driver.open_marketplace()
         driver.open_url("https://www.facebook.com/marketplace/you/selling/")
-        listings = driver.get_my_listings() or []
+        # Relist & Edit ONLY: wait for a visible listing before reading.
+        # The shared get_my_listings() stays untouched for other actions.
+        scoped = getattr(driver, "relist_edit_get_selling_listings", None)
+        if callable(scoped):
+            listings = scoped() or []
+        else:
+            listings = driver.get_my_listings() or []
         targets = [lst for lst in listings if lst.get("id")][:want]
         if not targets:
             self.log(f"[{label}] No selling listings available to edit; account marked Done",
