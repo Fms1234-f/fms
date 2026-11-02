@@ -93,6 +93,10 @@ class RunIn(BaseModel):
     renew_max_count: int = 5
     publish_drafts_min_count: int = 1
     publish_drafts_max_count: int = 3
+    relist_edit_min_count: int = 1
+    relist_edit_max_count: int = 3
+    relist_edit_price_direction: str = "descending"
+    relist_edit_price_delta: float = 3.0
     create_listings_count: int = 1
     scrap_include_description: bool = True
     scrap_include_location: bool = True

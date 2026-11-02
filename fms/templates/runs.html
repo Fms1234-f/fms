@@ -171,7 +171,7 @@
 {% endblock %}
 {% block scripts %}
 <script>
-const POSTING_MODES = ['complete','draft_publish','manual_publish','relist_edit','create_drafts','publish_drafts','create_listings_only'];
+const POSTING_MODES = ['complete','draft_publish','manual_publish','create_drafts','publish_drafts','create_listings_only'];
 function stepBatch(d){
   const el = document.getElementById('batchSize');
   el.value = Math.min(10, Math.max(1, (parseInt(el.value)||2) + d));

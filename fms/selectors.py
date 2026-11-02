@@ -163,6 +163,10 @@ def MKT_EDIT_URL(listing_id: str) -> str:
 SCR_MY_LISTING_LINKS = ("css", "a[href*='/marketplace/item/']")
 F_SAVE_EDIT_BUTTON = ("css", "div[aria-label='Save'][role='button'], "
                              "button[type='submit']")
+# Relist & Edit: the selling-page edit form's submit control is labelled
+# "Update" (the create form uses "Save"). Tried first, Save is the fallback.
+F_RELIST_EDIT_UPDATE_BUTTON = ("css", "div[aria-label='Update'][role='button'], "
+                                   "button:has-text('Update')")
 
 # ------------------------------------------------- scrap (read-only) ---
 # Best-effort selectors for extracting a listing's public data.

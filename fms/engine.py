@@ -61,8 +61,10 @@ ACTIONS = [
 MODES = (tuple(key for key, _ in ACTIONS)
          + ("draft_publish", "renew_listing", "complete", "manual_publish", "script", "wait_next_turn"))
 # Modes that create listings and therefore need product datasets.
+# relist_edit is NOT here: like delete_relist, the direct Relist & Edit
+# flow edits the account's own selling-page listings and needs no product.
 POSTING_MODES = {"complete", "test_single_post", "draft_publish", "draft_publish_1", "manual_publish",
-                 "relist_edit", "create_drafts", "publish_drafts", "create_listings_only"}
+                 "create_drafts", "publish_drafts", "create_listings_only"}
 PUBLISH_MODES = ("all_together", "one_by_one")
 
 
@@ -117,6 +119,10 @@ class RunConfig:
     renew_max_count: int = 5        # lower/upper limit)
     publish_drafts_min_count: int = 1  # standalone Publish Drafts count range
     publish_drafts_max_count: int = 3
+    relist_edit_min_count: int = 1  # Relist & Edit: how many of the account's
+    relist_edit_max_count: int = 3  # own selling-page listings to edit
+    relist_edit_price_direction: str = "descending"  # ascending | descending
+    relist_edit_price_delta: float = 3.0  # price change amount (user's 2, 3, ...)
     create_listings_count: int = 1  # Create Listings Only: exact filled forms per account
     min_price: float | None = None   # None -> use product base_price
     max_price: float | None = None
@@ -182,6 +188,13 @@ class RunConfig:
         if (self.publish_drafts_min_count < 1
                 or self.publish_drafts_max_count < self.publish_drafts_min_count):
             raise ValueError("bad publish_drafts_min_count/publish_drafts_max_count")
+        if (self.relist_edit_min_count < 1
+                or self.relist_edit_max_count < self.relist_edit_min_count):
+            raise ValueError("bad relist_edit_min_count/relist_edit_max_count")
+        if str(self.relist_edit_price_direction).strip().lower() not in ("ascending", "descending"):
+            raise ValueError("relist_edit_price_direction must be ascending or descending")
+        if self.relist_edit_price_delta < 0:
+            raise ValueError("relist_edit_price_delta must not be negative")
         if self.create_listings_count < 1:
             raise ValueError("create_listings_count must be >= 1")
         if self.mode == "script":
@@ -224,6 +237,10 @@ class RunConfig:
             "renew_max_count": self.renew_max_count,
             "publish_drafts_min_count": self.publish_drafts_min_count,
             "publish_drafts_max_count": self.publish_drafts_max_count,
+            "relist_edit_min_count": self.relist_edit_min_count,
+            "relist_edit_max_count": self.relist_edit_max_count,
+            "relist_edit_price_direction": self.relist_edit_price_direction,
+            "relist_edit_price_delta": self.relist_edit_price_delta,
             "min_price": self.min_price, "max_price": self.max_price,
             "min_delay_s": self.min_delay_s, "max_delay_s": self.max_delay_s,
             "shuffle": self.shuffle, "split_locations": self.split_locations,
@@ -1075,7 +1092,7 @@ class RunController:
         elif mode == "manual_publish":
             self._manual_publish_flow(account, driver, quota, account_idx)
         elif mode == "relist_edit":
-            self._relist_flow(account, driver, quota, account_idx)
+            self._relist_edit_direct_flow(account, driver)
         elif mode == "delete_relist":
             self._delete_relist_ui_flow(account, driver)
         elif mode == "create_drafts":
@@ -2257,6 +2274,62 @@ class RunController:
         if error:
             self.log(f"[{label}] Delete & Relist workflow error: {error}",
                      level="warning", account_id=account["id"])
+
+    # -- mode: relist_edit (direct price edit, no products) ------------------------
+    def _relist_edit_direct_flow(self, account: dict, driver) -> None:
+        """User-confirmed Relist & Edit flow, per account, in order:
+        feed fully loaded -> Marketplace loaded -> selling page loaded ->
+        that account's OWN first listing first, each listing opened in a
+        next tab, its edit form fully loaded, current price read from the
+        form, new price = current +/- delta (clamped at 1), price written,
+        Update clicked, repeat until the Min-Max count for this account is
+        done. No product dataset is used; the selling page is the source.
+        A listing whose form never loads is skipped (no price written) and
+        the run continues with the next listing; the account still ends
+        Done. Returning without raising lets the worker close the browser
+        and move to the next account, which restarts from its own first
+        listing."""
+        label = account["label"]
+        direction = str(self.cfg.relist_edit_price_direction or "").strip().lower()
+        if direction not in ("ascending", "descending"):
+            raise RuntimeError(f"Relist & Edit: unknown price direction {direction!r}")
+        delta = float(self.cfg.relist_edit_price_delta)
+        if delta < 0:
+            raise RuntimeError("Relist & Edit: price change must not be negative")
+        lo = max(1, int(self.cfg.relist_edit_min_count or 1))
+        hi = max(lo, int(self.cfg.relist_edit_max_count or lo))
+        want = random.randint(lo, hi)
+        method = getattr(driver, "relist_edit_listing_price", None)
+        if not callable(method):
+            self.log(f"[{label}] Relist & Edit requires a price-edit-capable browser driver",
+                     level="error", account_id=account["id"])
+            return
+        driver.open_url("https://www.facebook.com/")
+        driver.open_marketplace()
+        driver.open_url("https://www.facebook.com/marketplace/you/selling/")
+        listings = driver.get_my_listings() or []
+        targets = [lst for lst in listings if lst.get("id")][:want]
+        if not targets:
+            self.log(f"[{label}] No selling listings available to edit; account marked Done",
+                     account_id=account["id"])
+            return
+        edited = 0
+        failed = 0
+        for lst in targets:
+            result = method(lst["id"], direction, delta)
+            if isinstance(result, dict) and result.get("ok"):
+                edited += 1
+                self.log(f"[{label}] Relist & Edit: {lst['id']} price "
+                         f"{result.get('current_price')} -> {result.get('new_price')}",
+                         account_id=account["id"])
+            else:
+                failed += 1
+                reason = result.get("reason") if isinstance(result, dict) else "unknown"
+                self.log(f"[{label}] Relist & Edit: skipped {lst['id']} ({reason}); no price written",
+                         level="warning", account_id=account["id"])
+        self.log(f"[{label}] Relist & Edit: edited {edited}/{len(targets)} listing(s)"
+                 + (f" ({failed} skipped)" if failed else ""),
+                 account_id=account["id"])
 
     # -- mode: renew_listing_1 ------------------------------------------------------------
     def _renew_listing_1_flow(self, account: dict, driver, quota: int) -> None:

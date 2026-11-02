@@ -109,6 +109,23 @@ _STEALTH_JS = """() => {
 }"""
 
 
+def relist_edit_new_price(current: float, direction: str, delta: float) -> float:
+    """Relist & Edit price maths (single source for engine + both drivers).
+
+    Ascending adds the user's delta, Descending subtracts it, and the
+    result is clamped at 1 so a price can never reach 0 or go negative.
+    Raises ValueError on an unknown direction or a negative delta.
+    """
+    direction = str(direction or "").strip().lower()
+    if direction not in ("ascending", "descending"):
+        raise ValueError(f"unknown Relist & Edit price direction: {direction!r}")
+    delta = float(delta)
+    if delta < 0:
+        raise ValueError("Relist & Edit price change must not be negative")
+    new_price = float(current) + delta if direction == "ascending" else float(current) - delta
+    return max(1.0, new_price)
+
+
 class BaseDriver(ABC):
     """Interface the listing engine programs against."""
 
@@ -175,6 +192,19 @@ class BaseDriver(ABC):
 
     def edit_listing(self, listing_id: str, payload: dict) -> bool:
         """Open the Edit page for listing_id, rewrite fields, save."""
+        raise NotImplementedError
+
+    def relist_edit_listing_price(self, listing_id: str, direction: str,
+                                  delta: float) -> dict:
+        """Relist & Edit (direct): open listing_id's edit form in a NEW tab,
+        read its CURRENT price from the form (never guessed), write the
+        direction/delta-adjusted price, and click Update below.
+
+        Returns {"ok": bool, "listing_id": str, "current_price": float|None,
+        "new_price": float|None, "reason": str|None}. ok=False with reason
+        "form_not_loaded" means the form never became usable — no price
+        was written for that listing. The edit tab is closed either way.
+        """
         raise NotImplementedError
 
     def scrape_listing(self, url: str) -> dict | None:
@@ -3409,6 +3439,88 @@ class PlaywrightDriver(BaseDriver):
         except Exception:
             return False
 
+    def relist_edit_listing_price(self, listing_id: str, direction: str,
+                                  delta: float) -> dict:
+        """Relist & Edit (direct, one listing): open its edit form in a NEW
+        tab, wait until the form is usable, read the CURRENT price from
+        the form, write direction/delta-adjusted price, click Update.
+        The tab is closed on success and on failure. Never writes a price
+        to a form that did not finish loading or whose price could not
+        be read."""
+        self._ensure()
+        assert self._context is not None
+        tab = self._context.new_page()
+        try:
+            tab.goto(S.MKT_EDIT_URL(listing_id),
+                     wait_until="domcontentloaded", timeout=60000)
+            try:
+                tab.wait_for_load_state("load", timeout=30000)
+            except Exception:
+                pass
+            price_loc = S.to_playwright(tab, S.F_PRICE)
+            try:
+                price_loc.wait_for(state="visible", timeout=15000)
+            except Exception:
+                self._last_error = (f"Relist & Edit: edit form did not finish "
+                                    f"loading for listing {listing_id}")
+                return {"ok": False, "listing_id": listing_id,
+                        "current_price": None, "new_price": None,
+                        "reason": "form_not_loaded"}
+            try:
+                raw = (price_loc.input_value() or "").strip()
+                current = float(raw.replace(",", "").replace("$", "")
+                                .replace("£", "").replace("€", ""))
+            except Exception:
+                self._last_error = (f"Relist & Edit: could not read the "
+                                    f"current price for listing {listing_id}")
+                return {"ok": False, "listing_id": listing_id,
+                        "current_price": None, "new_price": None,
+                        "reason": "price_not_readable"}
+            try:
+                new_price = relist_edit_new_price(current, direction, delta)
+            except ValueError as exc:
+                self._last_error = f"Relist & Edit: {exc}"
+                return {"ok": False, "listing_id": listing_id,
+                        "current_price": current, "new_price": None,
+                        "reason": "bad_direction_or_delta"}
+            try:
+                price_loc.fill("")
+                self._type(price_loc, str(int(new_price))
+                           if float(new_price).is_integer() else str(new_price))
+            except Exception as exc:
+                self._last_error = (f"Relist & Edit: could not write the new "
+                                    f"price for listing {listing_id}: {exc}")
+                return {"ok": False, "listing_id": listing_id,
+                        "current_price": current, "new_price": None,
+                        "reason": "price_write_failed"}
+            try:
+                update_loc = S.to_playwright(tab, S.F_RELIST_EDIT_UPDATE_BUTTON)
+                update_loc.wait_for(state="visible", timeout=15000)
+                human.human_click(tab, update_loc)
+            except Exception:
+                try:
+                    human.human_click(tab, S.to_playwright(tab, S.F_SAVE_EDIT_BUTTON))
+                except Exception as exc:
+                    self._last_error = (f"Relist & Edit: Update button not "
+                                        f"found for listing {listing_id}: {exc}")
+                    return {"ok": False, "listing_id": listing_id,
+                            "current_price": current, "new_price": new_price,
+                            "reason": "update_button_not_found"}
+            human.human_pause(1500, 3000)
+            return {"ok": True, "listing_id": listing_id,
+                    "current_price": current, "new_price": new_price,
+                    "reason": None}
+        except Exception as exc:
+            self._last_error = f"Relist & Edit failed for {listing_id}: {exc}"
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "error"}
+        finally:
+            try:
+                tab.close()
+            except Exception:
+                pass
+
     # -- Phase 2: scrap (read-only) -------------------------------------------------
     def open_marketplace(self) -> None:
         """Navigate the main page to Marketplace (Download Images & Titles:
@@ -4906,6 +5018,8 @@ class MockDriver(BaseDriver):
     fake_listings: list[dict] = []  # get_my_listings() returns this (per test)
     fake_scrapes: dict[str, dict] = {}  # scrape_listing(url) returns this
     fake_take_action: list[dict] = []  # get_take_action_listings() returns this
+    fake_relist_edit_prices: dict[str, float] = {}  # listing_id -> current price
+    fake_relist_edit_not_loaded: set[str] = set()  # forms that never load
 
     def __init__(self, account: dict):
         super().__init__(account)
@@ -4924,6 +5038,8 @@ class MockDriver(BaseDriver):
             cls.fake_take_action = []
             cls.fake_tabs = []
             cls.fake_draft_count = 2
+            cls.fake_relist_edit_prices = {}
+            cls.fake_relist_edit_not_loaded = set()
             cls._draft_seq = 0
             cls._tab_seq = 0
 
@@ -5121,6 +5237,34 @@ class MockDriver(BaseDriver):
                      title=payload.get("title"))
         time.sleep(type(self).post_delay)
         return True
+
+    def relist_edit_listing_price(self, listing_id: str, direction: str,
+                                  delta: float) -> dict:
+        """Mock Relist & Edit: prices come from fake_relist_edit_prices;
+        listings in fake_relist_edit_not_loaded simulate a form that never
+        became usable — no price write is recorded for them."""
+        if listing_id in getattr(type(self), "fake_relist_edit_not_loaded", set()):
+            self._record("relist_edit_price_skipped", listing_id=listing_id,
+                         reason="form_not_loaded")
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "form_not_loaded"}
+        current = float(getattr(type(self), "fake_relist_edit_prices", {})
+                        .get(listing_id, 100.0))
+        try:
+            new_price = relist_edit_new_price(current, direction, delta)
+        except ValueError as exc:
+            self._record("relist_edit_price_skipped", listing_id=listing_id,
+                         reason=str(exc))
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": current, "new_price": None,
+                    "reason": "bad_direction_or_delta"}
+        self._record("relist_edit_price", listing_id=listing_id,
+                     direction=direction, delta=delta,
+                     current_price=current, new_price=new_price)
+        return {"ok": True, "listing_id": listing_id,
+                "current_price": current, "new_price": new_price,
+                "reason": None}
 
     def scrape_listing(self, url: str) -> dict | None:
         data = type(self).fake_scrapes.get(url)

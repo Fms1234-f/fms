@@ -56,6 +56,7 @@
         <label id="mmMaxAdsField"><span id="mmMaxLabel">Max listings</span><br><input type="number" id="mmMaxAds" value="3" min="1" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMinPriceField">Min price<br><input type="number" id="mmMinPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMaxPriceField">Max price<br><input type="number" id="mmMaxPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
+        <label id="mmRelistEditField" style="display:none;grid-column:1/-1"><span>Price direction</span><br><label class="check"><input type="radio" name="mmRelistDirection" value="ascending"> Ascending (price barhao)</label> <label class="check"><input type="radio" name="mmRelistDirection" value="descending" checked> Descending (price ghatao)</label><br><span style="font-size:12px;color:var(--muted)">Price change amount</span><br><input type="number" id="mmRelistDelta" value="3" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmLaunchUrlField" style="display:none;grid-column:1/-1"><span>Launch URL</span><br><input type="text" id="mmLaunchUrl" value="www.facebook.com" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmLocationField" style="display:none;grid-column:1/-1"><span>Enter location</span><br><input type="text" id="mmLocation" placeholder="e.g. Manchester" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
       </div>
@@ -142,13 +143,15 @@ function configureMinMaxDialog(){
   const isCreateListingsOnly = selectedAction === 'create_listings_only';
   const isLaunchFast = selectedAction === 'browser_launch_fast';
   const isChangeLocation = selectedAction === 'change_location';
+  const isRelistEdit = selectedAction === 'relist_edit';
   const isCountOnly = isRenew1 || isDeleteRelist || isPublishDrafts;
-  document.getElementById('mmMinLabel').textContent = isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings')));
+  document.getElementById('mmMinLabel').textContent = isRelistEdit ? 'Min Relist & Edit' : (isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings'))));
   document.getElementById('mmMaxAdsField').style.display = isLaunchFast ? 'none' : (isCreateListingsOnly ? 'none' : (isChangeLocation ? 'none' : ''));
-  document.getElementById('mmMaxLabel').textContent = isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings'));
-  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : ''))));
-  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : ''))));
+  document.getElementById('mmMaxLabel').textContent = isRelistEdit ? 'Max Relist & Edit' : (isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings')));
+  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : '')))));
+  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : '')))));
   document.getElementById('mmMinAdsField').style.display = isLaunchFast ? 'none' : (isChangeLocation ? 'none' : '');
+  document.getElementById('mmRelistEditField').style.display = isRelistEdit ? '' : 'none';
   document.getElementById('mmLaunchUrlField').style.display = isLaunchFast ? '' : 'none';
   document.getElementById('mmLocationField').style.display = isChangeLocation ? '' : 'none';
   document.getElementById('mmHint').textContent = isLaunchFast
@@ -160,8 +163,9 @@ function configureMinMaxDialog(){
     : (isDeleteRelist
     ? 'Har account par Min–Max ke darmiyan eligible Delete & Relist listings process hongi.'
     : (isRenew1 ? 'Har account ke liye Min–Max ke darmiyan eligible listings renew karne ki koshish hogi.'
+    : (isRelistEdit ? 'Har ID ki apni selling list ke start se Min–Max ke darmiyan listings ki price change hogi: Ascending = maujooda price + amount, Descending = maujooda price − amount.'
     : (isChangeLocation ? 'Har ID par Marketplace ki location isi naam par set hogi, phir ID Done mein jayegi aur browser close hoga.'
-    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.')))));
+    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.'))))));
 }
 async function startRun(){
   const gids = selectedGroups();
@@ -252,6 +256,14 @@ async function _doStartRun(){
     // Delete & Relist uses the same count controls, without changing Renew Listing 1.
     body.renew_min_count = _minA;
     body.renew_max_count = _maxA;
+  } else if(actVal === 'relist_edit'){
+    // Relist & Edit: count + direction + delta only; no price-filter fields.
+    body.relist_edit_min_count = _minA;
+    body.relist_edit_max_count = _maxA;
+    const _dir = document.querySelector('input[name="mmRelistDirection"]:checked');
+    body.relist_edit_price_direction = _dir ? _dir.value : 'descending';
+    const _delta = parseFloat(_mm('mmRelistDelta').value);
+    body.relist_edit_price_delta = isNaN(_delta) ? 3 : _delta;
   } else {
     // Preserve the existing Post and other actions' price-filter behavior.
     const _minP = parseFloat(_mm('mmMinPrice').value);

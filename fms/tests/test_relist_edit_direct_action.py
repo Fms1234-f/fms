@@ -1,0 +1,428 @@
+"""Relist & Edit (direct) — new standalone action, fake/mock pages only.
+
+Covers the user-confirmed 2026-11-02 design, nothing else:
+  1. Price maths: ascending adds delta, descending subtracts delta,
+     result clamped at 1 (never 0 or negative); bad direction / negative
+     delta rejected.
+  2. Engine flow: Min-Max count respected, listings taken in selling-page
+     order starting from the account's OWN first listing, navigation order
+     feed -> Marketplace -> selling page.
+  3. Form-not-loaded: the listing is skipped, NO price is written for it,
+     the run continues with the next listing and still ends Done.
+  4. Next account restarts from ITS OWN first listing (no cross-account
+     continuation).
+  5. Worker level (ListingEngine + MockDriver, no products at all):
+     both accounts end Done, browser closed for each, price edits in
+     order per account, no old product-based edit_listing calls, no new
+     listings posted.
+  6. Real-driver method on fake pages: edit form in a NEW tab, current
+     price read from the form, new price written, Update clicked, tab
+     closed; form-not-loaded and unreadable-price cases write nothing.
+  7. Source guards: dialog branch, API + engine fields, and
+     relist_edit NOT requiring products (engine POSTING_MODES and the
+     runs-page product-tick list).
+No live Facebook is involved anywhere in this file.
+"""
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+_TMP = tempfile.mkdtemp(prefix="fms_relist_edit_")
+os.environ["FMS_DATA_DIR"] = _TMP
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import fms.browser as B  # noqa: E402
+import fms.engine as E  # noqa: E402
+from fms import accounts as accounts_mod  # noqa: E402
+from fms.browser import MockDriver  # noqa: E402
+from fms.db import Database  # noqa: E402
+from fms.engine import ListingEngine, RunConfig  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+FEED_URL = "https://www.facebook.com/"
+SELLING_URL = "https://www.facebook.com/marketplace/you/selling/"
+EDIT_URL = "https://www.facebook.com/marketplace/edit/?listing_id="
+
+
+# ---------------------------------------------------------------- engine ---
+class FakeDriver:
+    """Engine-level double: selling listings + price edits, in order."""
+
+    def __init__(self, listings, prices, not_loaded=()):
+        self.listings = listings
+        self.prices = prices
+        self.not_loaded = set(not_loaded)
+        self.events = []
+        self.writes = []
+        self.closed = False
+
+    def open_url(self, url):
+        self.events.append(("open_url", url))
+
+    def open_marketplace(self):
+        self.events.append(("open_marketplace",))
+
+    def get_my_listings(self):
+        self.events.append(("get_my_listings",))
+        return [dict(x) for x in self.listings]
+
+    def relist_edit_listing_price(self, listing_id, direction, delta):
+        self.events.append(("edit", listing_id, direction, delta))
+        if listing_id in self.not_loaded:
+            return {"ok": False, "listing_id": listing_id,
+                    "current_price": None, "new_price": None,
+                    "reason": "form_not_loaded"}
+        current = self.prices[listing_id]
+        new_price = B.relist_edit_new_price(current, direction, delta)
+        self.writes.append((listing_id, current, new_price))
+        return {"ok": True, "listing_id": listing_id,
+                "current_price": current, "new_price": new_price,
+                "reason": None}
+
+    def close(self):
+        self.closed = True
+
+
+def make_controller(lo, hi, direction="descending", delta=3.0):
+    ctl = E.RunController.__new__(E.RunController)
+    ctl.cfg = SimpleNamespace(relist_edit_min_count=lo,
+                              relist_edit_max_count=hi,
+                              relist_edit_price_direction=direction,
+                              relist_edit_price_delta=delta)
+    ctl.logs = []
+    ctl.log = lambda msg, level="info", account_id=None: ctl.logs.append(msg)
+    return ctl
+
+
+def test_price_math_and_clamp():
+    assert B.relist_edit_new_price(100, "ascending", 3) == 103
+    assert B.relist_edit_new_price(100, "descending", 3) == 97
+    assert B.relist_edit_new_price(100, "ascending", 0) == 100
+    # Clamp: a price must never reach 0 or go negative.
+    assert B.relist_edit_new_price(2, "descending", 3) == 1
+    assert B.relist_edit_new_price(1, "descending", 5) == 1
+    with pytest.raises(ValueError):
+        B.relist_edit_new_price(100, "sideways", 3)
+    with pytest.raises(ValueError):
+        B.relist_edit_new_price(100, "descending", -1)
+
+
+def test_engine_count_order_and_navigation():
+    listings = [{"id": "L1", "title": "Old 1"}, {"id": "L2", "title": "Old 2"},
+                {"id": "L3", "title": "Old 3"}]
+    drv = FakeDriver(listings, {"L1": 100.0, "L2": 200.0, "L3": 300.0})
+    ctl = make_controller(2, 2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == [("L1", 100.0, 97.0), ("L2", 200.0, 197.0)]
+    nav = [e for e in drv.events if e[0] in ("open_url", "open_marketplace")]
+    assert nav == [("open_url", FEED_URL), ("open_marketplace",),
+                   ("open_url", SELLING_URL)], nav
+    assert any("edited 2/2" in m for m in ctl.logs), ctl.logs
+
+
+def test_engine_ascending_adds_delta():
+    drv = FakeDriver([{"id": "L1", "title": "Old 1"}],
+                     {"L1": 100.0})
+    ctl = make_controller(1, 1, direction="ascending", delta=2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == [("L1", 100.0, 102.0)]
+
+
+def test_engine_form_not_loaded_writes_nothing_for_it():
+    drv = FakeDriver([{"id": "L1", "title": "Old 1"},
+                      {"id": "L2", "title": "Old 2"}],
+                     {"L1": 100.0, "L2": 50.0}, not_loaded={"L1"})
+    ctl = make_controller(2, 2)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    # L1 skipped, L2 edited, run still completes (no exception).
+    assert drv.writes == [("L2", 50.0, 47.0)]
+    assert any("skipped L1 (form_not_loaded)" in m for m in ctl.logs), ctl.logs
+    assert any("no price written" in m for m in ctl.logs), ctl.logs
+    assert any("edited 1/2" in m for m in ctl.logs), ctl.logs
+
+
+def test_engine_each_account_restarts_from_its_own_first_listing():
+    ctl = make_controller(1, 1)
+    first = FakeDriver([{"id": "L1"}, {"id": "L2"}], {"L1": 10.0, "L2": 20.0})
+    ctl._relist_edit_direct_flow({"id": 1, "label": "Acct1"}, first)
+    second = FakeDriver([{"id": "A1"}, {"id": "A2"}], {"A1": 30.0, "A2": 40.0})
+    ctl._relist_edit_direct_flow({"id": 2, "label": "Acct2"}, second)
+    assert first.writes == [("L1", 10.0, 7.0)]
+    # Second account starts at ITS OWN first listing (A1), not after L1.
+    assert second.writes == [("A1", 30.0, 27.0)]
+
+
+def test_engine_no_listings_is_done_not_failure():
+    drv = FakeDriver([], {})
+    ctl = make_controller(1, 3)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == []
+    assert any("No selling listings available" in m for m in ctl.logs), ctl.logs
+
+
+def test_engine_bad_direction_raises():
+    drv = FakeDriver([{"id": "L1"}], {"L1": 10.0})
+    ctl = make_controller(1, 1, direction="sideways")
+    with pytest.raises(RuntimeError):
+        ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+
+
+def test_engine_config_validation():
+    with pytest.raises(ValueError):
+        RunConfig(group_id=1, mode="relist_edit",
+                  relist_edit_min_count=0)
+    with pytest.raises(ValueError):
+        RunConfig(group_id=1, mode="relist_edit",
+                  relist_edit_price_direction="sideways")
+    with pytest.raises(ValueError):
+        RunConfig(group_id=1, mode="relist_edit",
+                  relist_edit_price_delta=-2)
+    # No products required for this action (unlike posting modes).
+    cfg = RunConfig(group_id=1, mode="relist_edit")
+    assert cfg.product_ids == []
+    assert cfg.relist_edit_price_direction == "descending"
+    assert cfg.relist_edit_price_delta == 3.0
+    assert "relist_edit_price_direction" in cfg.to_dict()
+
+
+# ---------------------------------------------------------------- worker ---
+def _wait_until(fn, timeout=60.0, poll=0.2):
+    end = time.time() + timeout
+    while time.time() < end:
+        if fn():
+            return True
+        time.sleep(poll)
+    return False
+
+
+def test_worker_two_accounts_done_browser_closed_no_products():
+    MockDriver.reset()
+    MockDriver.activity_scale = 0.001
+    MockDriver.fake_listings = [{"id": "L1", "title": "Old 1"},
+                                {"id": "L2", "title": "Old 2"},
+                                {"id": "L3", "title": "Old 3"}]
+    MockDriver.fake_relist_edit_prices = {"L1": 100.0, "L2": 200.0,
+                                          "L3": 300.0}
+    eng = ListingEngine(Database(), driver_factory=MockDriver)
+    gid = accounts_mod.create_group(eng.db, f"re-edit-{time.time_ns()}")
+    accounts_mod.add_account(eng.db, gid, "re1@x.com", "pw1")
+    accounts_mod.add_account(eng.db, gid, "re2@x.com", "pw2")
+    cfg = RunConfig(group_id=gid, mode="relist_edit", batch_size=1,
+                    min_ads=2, max_ads=2,
+                    relist_edit_min_count=2, relist_edit_max_count=2,
+                    relist_edit_price_direction="descending",
+                    relist_edit_price_delta=3.0,
+                    min_delay_s=0.01, max_delay_s=0.02)
+    rid = eng.start_run(cfg)
+    assert _wait_until(lambda: eng.get_run(rid)["status"] == "completed", 60), \
+        eng.get_run(rid)
+    price_calls = [c for c in MockDriver.calls
+                   if c["event"] == "relist_edit_price"]
+    # Each account edits its OWN first two listings, in order: 4 edits total.
+    assert [(c["label"], c["listing_id"], c["new_price"])
+            for c in price_calls] == [
+                ("re1@x.com", "L1", 97.0), ("re1@x.com", "L2", 197.0),
+                ("re2@x.com", "L1", 97.0), ("re2@x.com", "L2", 197.0)], price_calls
+    closes = [c for c in MockDriver.calls if c["event"] == "close"]
+    assert {c["label"] for c in closes} == {"re1@x.com", "re2@x.com"}, closes
+    assert not [c for c in MockDriver.calls if c["event"] == "edit_listing"], \
+        "old product-based edit path must not run"
+    assert not [c for c in MockDriver.calls if c["event"] == "post_start"], \
+        "must not create new listings"
+    MockDriver.reset()
+
+
+# ------------------------------------------------------- mock driver -----
+def test_mock_driver_clamp_and_not_loaded():
+    MockDriver.reset()
+    MockDriver.fake_relist_edit_prices = {"L1": 2.0, "L2": 100.0}
+    MockDriver.fake_relist_edit_not_loaded = {"L2"}
+    mock = MockDriver({"label": "Acct"})
+    res = mock.relist_edit_listing_price("L1", "descending", 3)
+    assert res == {"ok": True, "listing_id": "L1", "current_price": 2.0,
+                   "new_price": 1.0, "reason": None}
+    res = mock.relist_edit_listing_price("L2", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "form_not_loaded"
+    assert [c for c in MockDriver.calls
+            if c["event"] == "relist_edit_price"
+            and c["listing_id"] == "L2"] == [], "no price write for L2"
+    MockDriver.reset()
+
+
+# ------------------------------------------------------- fake page -------
+class _FakeMouse:
+    def move(self, *a, **k):
+        pass
+
+    def click(self, *a, **k):
+        pass
+
+
+class _FakeLocator:
+    def __init__(self, page, kind):
+        self._page = page
+        self.kind = kind
+
+    def wait_for(self, state=None, timeout=None):
+        if self.kind == "price" and self._page.price_never_ready:
+            raise RuntimeError("never ready")
+        if self.kind == "update" and self._page.update_missing:
+            raise RuntimeError("no update button")
+        return None
+
+    def input_value(self):
+        return self._page.price_value
+
+    def fill(self, text):
+        self._page.fills.append(text)
+
+    def scroll_into_view_if_needed(self, timeout=None):
+        pass
+
+    def bounding_box(self):
+        return None
+
+    def click(self, delay=None, timeout=None):
+        self._page.clicks.append(self.kind)
+
+
+class _FakeCollection:
+    def __init__(self, locator):
+        self._locator = locator
+
+    @property
+    def first(self):
+        return self._locator
+
+
+class _FakeTab:
+    def __init__(self, price_value="100", price_never_ready=False,
+                 update_missing=False):
+        self.price_value = price_value
+        self.price_never_ready = price_never_ready
+        self.update_missing = update_missing
+        self.url = ""
+        self.gotos = []
+        self.fills = []
+        self.clicks = []
+        self.closed = False
+        self.mouse = _FakeMouse()
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.url = url
+        self.gotos.append(url)
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def locator(self, sel):
+        if "Price" in sel:
+            kind = "price"
+        elif "Update" in sel:
+            kind = "update"
+        elif "Save" in sel:
+            kind = "save"
+        else:
+            kind = "other"
+        return _FakeCollection(_FakeLocator(self, kind))
+
+
+class _FakeContext:
+    def __init__(self, tab):
+        self.tab = tab
+        self.new_pages = 0
+
+    def new_page(self):
+        self.new_pages += 1
+        return self.tab
+
+
+def _make_playwright_driver(tab, monkeypatch):
+    drv = B.PlaywrightDriver.__new__(B.PlaywrightDriver)
+    drv.account = {}
+    drv._ensure = lambda: None
+    drv._context = _FakeContext(tab)
+    drv._page = None
+    drv._pause_checkpoint = lambda: None
+    drv._type = lambda loc, text, hybrid_ok=False: loc.fill(text)
+    monkeypatch.setattr(B.human, "human_pause", lambda *a, **k: None)
+    return drv
+
+
+def test_playwright_fake_page_reads_writes_clicks_update_closes_tab(monkeypatch):
+    tab = _FakeTab(price_value="100")
+    drv = _make_playwright_driver(tab, monkeypatch)
+    res = drv.relist_edit_listing_price("L1", "descending", 3)
+    assert res["ok"] is True
+    assert res["current_price"] == 100.0 and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1"], "edit form opened in a new tab"
+    assert tab.fills == ["", "97"], "old price cleared, new price written"
+    assert tab.clicks == ["update"], "Update clicked"
+    assert tab.closed is True
+
+
+def test_playwright_fake_page_form_not_loaded_writes_nothing(monkeypatch):
+    tab = _FakeTab(price_never_ready=True)
+    drv = _make_playwright_driver(tab, monkeypatch)
+    res = drv.relist_edit_listing_price("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "form_not_loaded"
+    assert tab.fills == [] and tab.clicks == []
+    assert tab.closed is True
+
+
+def test_playwright_fake_page_unreadable_price_writes_nothing(monkeypatch):
+    tab = _FakeTab(price_value="not-a-price")
+    drv = _make_playwright_driver(tab, monkeypatch)
+    res = drv.relist_edit_listing_price("L1", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "price_not_readable"
+    assert tab.fills == [] and tab.clicks == []
+    assert tab.closed is True
+
+
+def test_playwright_fake_page_update_falls_back_to_save(monkeypatch):
+    tab = _FakeTab(price_value="50", update_missing=True)
+    drv = _make_playwright_driver(tab, monkeypatch)
+    res = drv.relist_edit_listing_price("L1", "ascending", 2)
+    assert res["ok"] is True and res["new_price"] == 52.0
+    assert tab.clicks == ["save"], "Save used only when Update is absent"
+
+
+# ------------------------------------------------------- source guards ---
+def test_dialog_has_relist_edit_branch_and_no_price_fields():
+    src = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "mmRelistEditField" in src
+    assert 'name="mmRelistDirection"' in src
+    assert "mmRelistDelta" in src
+    assert "Min Relist & Edit" in src
+    assert "Max Relist & Edit" in src
+    assert "else if(actVal === 'relist_edit')" in src
+    assert "body.relist_edit_min_count = _minA" in src
+    assert "body.relist_edit_price_direction" in src
+    assert "body.relist_edit_price_delta" in src
+    assert "isRelistEdit ? 'none'" in src
+
+
+def test_engine_routes_to_direct_flow_without_product_requirement():
+    src = (ROOT / "engine.py").read_text(encoding="utf-8")
+    assert 'elif mode == "relist_edit":\n            self._relist_edit_direct_flow(account, driver)' in src
+    assert "def _relist_edit_direct_flow" in src
+    assert '"relist_edit"' not in src.split("POSTING_MODES =", 1)[1].split("PUBLISH_MODES", 1)[0]
+
+
+def test_api_and_runs_page_do_not_require_products_for_relist_edit():
+    app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "relist_edit_min_count" in app_src
+    assert "relist_edit_price_direction" in app_src
+    assert "relist_edit_price_delta" in app_src
+    runs_src = (ROOT / "templates" / "runs.html").read_text(encoding="utf-8")
+    modes_line = [ln for ln in runs_src.splitlines()
+                  if ln.strip().startswith("const POSTING_MODES")][0]
+    assert "relist_edit" not in modes_line
