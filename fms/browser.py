@@ -4514,7 +4514,11 @@ class PlaywrightDriver(BaseDriver):
                     "error": f"{type(exc).__name__}: {exc}"}
 
     def set_marketplace_location(self, location: str) -> bool:
-        """Best-effort: change the Marketplace location picker value."""
+        """Change the Marketplace location picker value, end to end:
+        Marketplace -> location filter -> Change location dialog ->
+        type name -> pick first suggestion -> scroll Apply into view ->
+        Apply -> wait for Marketplace to reload. Returns True only when
+        Apply is clicked and the dialog closes afterwards."""
         self._ensure()
         page = self._page
         assert page is not None
@@ -4531,6 +4535,32 @@ class PlaywrightDriver(BaseDriver):
             first = S.to_playwright(page, S.F_LOCATION_FIRST_RESULT)
             first.wait_for(timeout=8000)
             human.human_click(page, first)
+            human.human_pause(1000, 2000)
+            # The Apply button sits at the bottom of the Change location
+            # dialog — pick the visible one (other dialogs may hide their
+            # own), scroll it into view, then click it (v0.2.188).
+            apply_btn = None
+            for cand in page.get_by_role(
+                    "button", name=re.compile("Apply", re.I)).all():
+                try:
+                    if cand.is_visible():
+                        apply_btn = cand
+                        break
+                except Exception:
+                    continue
+            if apply_btn is None:
+                return False
+            try:
+                apply_btn.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                page.mouse.wheel(0, 1200)
+                human.human_pause(500, 1000)
+            apply_btn.click(timeout=5000)
+            # Let Marketplace reload after Apply; the dialog must close.
+            try:
+                apply_btn.wait_for(state="detached", timeout=10000)
+            except Exception:
+                return False
             human.human_pause(1500, 2500)
             return True
         except Exception:

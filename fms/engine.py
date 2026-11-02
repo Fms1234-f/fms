@@ -2323,13 +2323,18 @@ class RunController:
         label = account["label"]
         target = self.cfg.new_location
         if not target:
-            self.log(f"[{label}] no new location given",
-                     level="warning", account_id=account["id"])
-            return
+            # No location to apply — failing (not a silent Done) keeps
+            # the board honest; the dashboard dialog requires the name.
+            raise RuntimeError("no new location given")
         ok = driver.set_marketplace_location(target)
         self.log(f"[{label}] marketplace location -> '{target}': "
                  f"{'OK' if ok else 'FAILED'}",
                  level="info" if ok else "error", account_id=account["id"])
+        if not ok:
+            # A failed Apply must land in Failed (browser left open for
+            # inspection), never a false Done.
+            raise RuntimeError(
+                f"marketplace location change failed for '{target}'")
 
 
     # -- mode: wait_next_turn (standalone placeholder) --------------------------------------

@@ -57,6 +57,7 @@
         <label id="mmMinPriceField">Min price<br><input type="number" id="mmMinPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmMaxPriceField">Max price<br><input type="number" id="mmMaxPrice" placeholder="—" min="0" step="any" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
         <label id="mmLaunchUrlField" style="display:none;grid-column:1/-1"><span>Launch URL</span><br><input type="text" id="mmLaunchUrl" value="www.facebook.com" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
+        <label id="mmLocationField" style="display:none;grid-column:1/-1"><span>Enter location</span><br><input type="text" id="mmLocation" placeholder="e.g. Manchester" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px"></label>
       </div>
       <div id="mmHint" style="font-size:12px;color:var(--muted);margin-bottom:14px">Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.</div>
       <div style="display:flex;gap:10px;justify-content:flex-end">
@@ -140,14 +141,16 @@ function configureMinMaxDialog(){
   const isPublishDrafts = selectedAction === 'publish_drafts';
   const isCreateListingsOnly = selectedAction === 'create_listings_only';
   const isLaunchFast = selectedAction === 'browser_launch_fast';
+  const isChangeLocation = selectedAction === 'change_location';
   const isCountOnly = isRenew1 || isDeleteRelist || isPublishDrafts;
   document.getElementById('mmMinLabel').textContent = isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings')));
-  document.getElementById('mmMaxAdsField').style.display = isLaunchFast ? 'none' : (isCreateListingsOnly ? 'none' : '');
+  document.getElementById('mmMaxAdsField').style.display = isLaunchFast ? 'none' : (isCreateListingsOnly ? 'none' : (isChangeLocation ? 'none' : ''));
   document.getElementById('mmMaxLabel').textContent = isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings'));
-  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : '')));
-  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : '')));
-  document.getElementById('mmMinAdsField').style.display = isLaunchFast ? 'none' : '';
+  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : ''))));
+  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : ''))));
+  document.getElementById('mmMinAdsField').style.display = isLaunchFast ? 'none' : (isChangeLocation ? 'none' : '');
   document.getElementById('mmLaunchUrlField').style.display = isLaunchFast ? '' : 'none';
+  document.getElementById('mmLocationField').style.display = isChangeLocation ? '' : 'none';
   document.getElementById('mmHint').textContent = isLaunchFast
     ? 'Har account ka browser isi URL par kholega, ID Done mein jayegi aur browser khula rahega.'
     : (isCreateListingsOnly
@@ -157,7 +160,8 @@ function configureMinMaxDialog(){
     : (isDeleteRelist
     ? 'Har account par Min–Max ke darmiyan eligible Delete & Relist listings process hongi.'
     : (isRenew1 ? 'Har account ke liye Min–Max ke darmiyan eligible listings renew karne ki koshish hogi.'
-    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.'))));
+    : (isChangeLocation ? 'Har ID par Marketplace ki location isi naam par set hogi, phir ID Done mein jayegi aur browser close hoga.'
+    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.')))));
 }
 async function startRun(){
   const gids = selectedGroups();
@@ -183,6 +187,13 @@ function closeMinMax(){
   if(dlg){ dlg.style.display = 'none'; }
 }
 async function saveMinMax(){
+  // Change Marketplace Location: the dialog's only field is the location
+  // name — without it the action has nothing to apply, so stay open.
+  if(document.getElementById('actionSel').value === 'change_location'
+      && !(document.getElementById('mmLocation').value || '').trim()){
+    fmsAlert('Pehle location ka naam likhein.');
+    return;
+  }
   closeMinMax();
   await _doStartRun();
 }
@@ -259,6 +270,11 @@ async function _doStartRun(){
   // engine default facebook.com). Only this action sends it.
   if(actVal === 'browser_launch_fast'){
     body.launch_url = (_mm('mmLaunchUrl').value || '').trim();
+  }
+  // Change Marketplace Location: the dashboard dialog's only field is
+  // the location name. Only this action sends it.
+  if(actVal === 'change_location'){
+    body.new_location = (_mm('mmLocation').value || '').trim();
   }
   // Include all products (home page uses all products for posting modes).
   body.product_ids = {{ product_ids_json|default('[]') }};
