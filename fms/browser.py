@@ -4525,6 +4525,12 @@ class PlaywrightDriver(BaseDriver):
         try:
             page.goto(S.MARKETPLACE_URL, wait_until="domcontentloaded")
             human.human_pause(1500, 3000)
+            # v0.2.189: let Marketplace actually load — wait until the
+            # location filter is visible before starting the location
+            # process (a fixed short pause failed on slow pages, then
+            # the retry loop reopened the browser again and again).
+            S.to_playwright(page, S.MKT_LOCATION_BUTTON).wait_for(
+                state="visible", timeout=15000)
             human.human_click(page, S.to_playwright(page, S.MKT_LOCATION_BUTTON))
             human.human_pause(1000, 2000)
             loc = S.to_playwright(page, S.MKT_LOCATION_INPUT)

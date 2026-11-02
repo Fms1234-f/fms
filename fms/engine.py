@@ -919,8 +919,11 @@ class RunController:
         # v0.2.183 (user-approved): Login mode never retries — one
         # attempt's outcome is final (success -> Done, any failure ->
         # Failed with the browser left open), so one stuck browser
-        # can never hold up the queue. Every other mode retries as before.
-        attempts = (1 if self.cfg.mode == "login"
+        # can never hold up the queue. v0.2.189 (user-approved):
+        # Change Marketplace Location never retries either — one
+        # failed attempt lands in Failed at once, no reopen+retry
+        # loop. Every other mode retries as before.
+        attempts = (1 if self.cfg.mode in ("login", "change_location")
                     else 1 + max(0, int(self.cfg.retry_count)))
         for attempt in range(1, attempts + 1):
             try:
