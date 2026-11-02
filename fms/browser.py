@@ -116,8 +116,13 @@ class BaseDriver(ABC):
         self.account = account
 
     @abstractmethod
-    def login(self) -> bool:
-        """Log the account in (or reuse its session). Return True on success."""
+    def login(self, fast_fail: bool = False) -> bool:
+        """Log the account in (or reuse its session). Return True on success.
+
+        fast_fail (v0.2.184): Login-mode only — challenge screens fail at
+        once and the poll deadline is shorter. Default False preserves the
+        60s poll exactly for every other caller.
+        """
 
     @abstractmethod
     def post_listing(self, payload: dict) -> str | None:
@@ -666,11 +671,43 @@ class PlaywrightDriver(BaseDriver):
             raise last_exc
         raise RuntimeError("No login selector matched.")
 
-    def login(self) -> bool:
+    def _fast_challenge_reason(self, page) -> str | None:
+        """Login-mode fast path (v0.2.184): spot a Facebook challenge /
+        confirmation screen at once, without waiting out the poll.
+
+        Returns a reason, or None when the page looks like a normal
+        login/loading page. Only called when fast_fail is on.
+        """
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        if "checkpoint" in url or "captcha" in url:
+            return "Facebook checkpoint/captcha page"
+        try:
+            low = (page.inner_text("body") or "")[:4000].lower()
+        except Exception:
+            low = ""
+        for phrase in ("captcha",
+                       "we noticed an unusual login", "suspicious login",
+                       "confirm your identity", "verify your identity",
+                       "was this you", "confirm it's you", "is this you",
+                       "security check", "verify you're human",
+                       "i'm not a robot", "not a robot"):
+            if phrase in low:
+                return f"Facebook challenge screen ({phrase})"
+        return None
+
+    def login(self, fast_fail: bool = False) -> bool:
         """Email/password login with robust submit + outcome detection.
 
         On failure, ``self.login_error`` holds a human-readable reason so the
         run log shows WHY instead of a silent stall (v0.2.23).
+
+        fast_fail (v0.2.184, Login mode only): challenge/confirmation
+        screens fail at once (checked before the 8s indicator wait) and
+        the outcome poll is 20s instead of 60s. Default False keeps every
+        other mode on the 60s poll exactly as before.
         """
         self._ensure()
         self.login_error = ""
@@ -750,9 +787,18 @@ class PlaywrightDriver(BaseDriver):
 
         # Outcome detection: poll for up to ~60s and classify what happened
         # instead of silently stalling (v0.2.23).
-        deadline = time.time() + 60
+        # v0.2.184: Login mode fails FAST — 20s deadline, and challenge /
+        # confirmation screens fail at once (checked before the 8s
+        # indicator wait). Other modes keep the 60s poll exactly.
+        deadline_secs = 20 if fast_fail else 60
+        deadline = time.time() + deadline_secs
         twofa_handled = False
         while time.time() < deadline:
+            if fast_fail:
+                reason = self._fast_challenge_reason(page)
+                if reason:
+                    return fail(f"{reason} — needs manual review "
+                                f"(Login fast-fail)")
             if self._is_logged_in():
                 return True
             url = (page.url or "").lower()
@@ -806,7 +852,8 @@ class PlaywrightDriver(BaseDriver):
             human.human_pause(2000, 3000)
         if self._is_logged_in():
             return True
-        return fail("login did not complete within 60s (still not logged in)")
+        return fail(f"login did not complete within {deadline_secs}s "
+                    f"(still not logged in)")
 
     # -- posting ----------------------------------------------------------------
     def _location_candidate_identity(self, page, loc) -> tuple[bool, str]:
@@ -4849,7 +4896,7 @@ class MockDriver(BaseDriver):
             self.calls.append({"event": event, "label": self.account["label"],
                                "t": time.time(), **kw})
 
-    def login(self) -> bool:
+    def login(self, fast_fail: bool = False) -> bool:
         ix = self.account.get("ixbrowser") or {"enabled": False}
         with self._lock:
             self.calls.append({"event": "login", "label": self.account["label"],

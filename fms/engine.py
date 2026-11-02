@@ -1049,7 +1049,10 @@ class RunController:
                               account_idx: int) -> None:
         label = account["label"]
         self.log(f"[{label}] logging in…", account_id=account["id"])
-        if not driver.login():
+        # v0.2.184 (Login mode only, user-approved): fast-fail login —
+        # challenge screens fail at once, 20s poll. Every other mode
+        # calls login() with the default 60s poll, unchanged.
+        if not driver.login(fast_fail=(self.cfg.mode == "login")):
             raise _LoginFailed(label)
         # v0.2.25: "Change Marketplace Location Before Listing — Change only
         # once": set the group's location once right after login.
@@ -2485,7 +2488,11 @@ class RunController:
             # workers; each freed slot immediately takes the next pending
             # account instead of waiting for the whole wave to finish.
             n_workers = cfg.effective_parallelism()
-            gap_s = cfg.account_start_gap_s / max(0.1, cfg.speed)
+            # v0.2.184 (Login mode only, user-approved): no start gap —
+            # the next ID starts at once ("foran"). Other modes keep
+            # the anti-detection gap exactly as before.
+            gap_s = (0.0 if cfg.mode == "login"
+                     else cfg.account_start_gap_s / max(0.1, cfg.speed))
             self._all_accounts = list(accounts)
             acct_index = {a["id"]: i for i, a in enumerate(accounts)}
             quotas_by_id = {a["id"]: quotas[a["id"]] for a in accounts}
