@@ -214,7 +214,7 @@ el('mgBody').addEventListener('click', async function(e){
   if(act==='ma'){ openManageAccts(id, groupName(id)); }
   else if(act==='edit'){ mgShowAdd(id); }
   else if(act==='clone'){
-    const nn = prompt('Clone group name:', groupName(id)+' (copy)');
+    const nn = await fmsPrompt('Clone group name:', groupName(id)+' (copy)');
     if(nn===null) return;
     const fd = new FormData(); if(nn.trim()) fd.append('new_name', nn.trim());
     const r = await fetch('/api/groups/'+id+'/clone', {method:'POST', body:fd});

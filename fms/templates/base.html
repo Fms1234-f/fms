@@ -133,6 +133,38 @@ function fmsAlert(msg){
   ov.querySelector('#fmsOk2').onclick = () => ov.remove();
   ov.onclick = e => { if(e.target === ov) ov.remove(); };
 }
+// Custom FMS prompt dialog (v0.2.185): same styled card as fmsConfirm,
+// with a text input — replaces the native prompt() whose browser header
+// shows the ugly "127.0.0.1:8000 says" origin. Resolves the typed value
+// on OK/Enter, null on Cancel/Escape/outside-click. The default value is
+// assigned via the input property (never interpolated into HTML), so
+// group names with quotes or markup stay safe. A second call while one
+// is open resolves null at once (native prompt() was modal-blocking).
+function fmsPrompt(msg, defVal){
+  if(document.getElementById('fmsPromptOv')) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const ov = document.createElement('div');
+    ov.id = 'fmsPromptOv';
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+    ov.innerHTML = '<div style="background:var(--card,#1e2430);border:1px solid var(--line,#334);border-radius:12px;padding:24px 28px;max-width:380px;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)">'
+      + '<div style="font-size:20px;font-weight:bold;margin-bottom:12px">🏪 FMS</div>'
+      + '<div style="margin-bottom:12px;color:var(--fg,#dbe2f0)">' + msg + '</div>'
+      + '<input id="fmsInput" style="width:100%;box-sizing:border-box;padding:9px 12px;border-radius:8px;border:1px solid var(--line,#334);background:#fff;color:#111;font-size:15px;margin-bottom:20px">'
+      + '<div style="display:flex;gap:10px;justify-content:center">'
+      + '<button id="fmsOk" class="btn" style="background:#22c55e;color:#fff;border:none;padding:9px 28px;border-radius:8px;font-size:15px;cursor:pointer">OK</button>'
+      + '<button id="fmsCancel" class="btn" style="padding:9px 28px;border-radius:8px;font-size:15px;cursor:pointer">Cancel</button>'
+      + '</div></div>';
+    document.body.appendChild(ov);
+    const inp = ov.querySelector('#fmsInput');
+    inp.value = defVal || '';
+    inp.focus(); inp.select();
+    const done = v => { ov.remove(); resolve(v); };
+    ov.querySelector('#fmsOk').onclick = () => done(inp.value);
+    ov.querySelector('#fmsCancel').onclick = () => done(null);
+    ov.onclick = e => { if(e.target === ov) done(null); };
+    inp.onkeydown = e => { if(e.key === 'Enter') done(inp.value); if(e.key === 'Escape') done(null); };
+  });
+}
 async function quitFms(){
   if(!await fmsConfirm('Quit FMS? Any running listings will stop.')) return;
   try { await fetch('/api/shutdown', {method:'POST'}); } catch(e) {}
