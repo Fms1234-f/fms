@@ -3395,16 +3395,22 @@ class PlaywrightDriver(BaseDriver):
         return out
 
     def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
-        """Relist & Edit ONLY: read the selling page, but wait first until
-        at least one listing link is actually VISIBLE, polling up to
-        timeout_s seconds (default 30). This is the selling-page wait the
-        user asked for on 2026-11-02; it is used ONLY by the Relist & Edit
-        direct flow. The shared get_my_listings() is deliberately NOT
-        changed, because other actions (legacy Delete & Relist, Relist,
-        script blocks, delete-duplicates) also call it and must keep their
-        old behaviour. Same link parsing, order and 50 cap as
-        get_my_listings(); a page with nothing visible by the deadline is
-        reported as empty (never a crash)."""
+        """Relist & Edit ONLY: read the selling page, starting the moment
+        ANY listing is actually VISIBLE — no confirmation, no safety
+        gate, no waiting for every listing. This is the simplified start
+        the user ordered on 2026-11-03, replacing the old "first link
+        visible" wait that timed out on the real selling page even
+        though listings existed (a hidden first link blocked the whole
+        read). Poll up to timeout_s seconds (default 30) for any
+        visible listing link; the returned list starts at the FIRST
+        VISIBLE listing in page order, so work starts there at once.
+        Used ONLY by the Relist & Edit direct flow. The shared
+        get_my_listings() is deliberately NOT changed, because other
+        actions (legacy Delete & Relist, Relist, script blocks,
+        delete-duplicates) also call it and must keep their old
+        behaviour. Same link parsing, order and 50 cap as
+        get_my_listings(); a page with nothing visible by the deadline
+        is reported as empty (never a crash)."""
         self._ensure()
         page = self._page
         assert page is not None
@@ -3413,22 +3419,30 @@ class PlaywrightDriver(BaseDriver):
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
             links = page.locator(S.SCR_MY_LISTING_LINKS[1])
             deadline = time.time() + max(0.0, float(timeout_s))
-            visible = False
+            visible_handles = None
+            visible_idx = None
             while time.time() < deadline:
                 try:
-                    remaining_ms = max(1, int((deadline - time.time()) * 1000))
-                    links.first.wait_for(state="visible",
-                                         timeout=min(1000, remaining_ms))
-                    visible = True
-                    break
+                    handles = links.all()
                 except Exception:
-                    if time.time() >= deadline:
-                        break
-                    continue
-            if not visible:
+                    handles = []
+                for i, handle in enumerate(handles):
+                    try:
+                        if handle.is_visible():
+                            visible_handles = handles
+                            visible_idx = i
+                            break
+                    except Exception:
+                        continue
+                if visible_idx is not None:
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.25)
+            if visible_idx is None or visible_handles is None:
                 return []
             seen: set[str] = set()
-            for link in links.all()[:50]:
+            for link in visible_handles[visible_idx:][:50]:
                 try:
                     href = link.get_attribute("href") or ""
                 except Exception:
@@ -3596,18 +3610,22 @@ class PlaywrightDriver(BaseDriver):
         that listing's turn, so no stale card is ever used. Steps: find
         this listing's link, click the "..." button on the same card
         (paired by card order), wait for the menu, read the menu's
-        "Edit listing" LINK, verify that link really belongs to this
-        listing, and open THAT link in a new tab — the faithful
-        automation equivalent of the user's right-click -> "Open link
-        in new tab" (the browser's native context menu is browser UI,
-        not page content, and cannot itself be clicked by automation).
+        "Edit listing" LINK, and open THAT link in a new tab — the
+        faithful automation equivalent of the user's right-click ->
+        "Open link in new tab" (the browser's native context menu is
+        browser UI, not page content, and cannot itself be clicked by
+        automation). Simplified 2026-11-03, per the user's order: NO
+        link-identity verification — the card whose "..." was clicked
+        IS the listing being edited, so its menu's "Edit listing" link
+        is opened whatever its destination says; a destination that
+        does not contain the listing id is NOT a skip reason any more.
         The edit tab is then priced exactly as before and closed on
         success and on failure. If the card, the "..." button, the menu,
-        or the "Edit listing" link cannot be found, or the link belongs
-        to a different listing, the listing is SKIPPED with a logged
-        reason, NO price is written, and the run continues with the
-        next listing. A menu-step skip NEVER falls back to the direct
-        edit URL — that would hide the very step the user asked for."""
+        or the "Edit listing" link genuinely cannot be found, the
+        listing is SKIPPED with a logged reason, NO price is written,
+        and the run continues with the next listing. A menu-step skip
+        NEVER falls back to the direct edit URL — that would hide the
+        very step the user asked for."""
         self._ensure()
         assert self._context is not None
         page = self._page
@@ -3655,7 +3673,10 @@ class PlaywrightDriver(BaseDriver):
             human.human_click(page, buttons[idx])
         except Exception:
             return _skip("menu_button_not_found")
-        # 3. The menu's "Edit listing" link, verified against this listing.
+        # 3. The menu's "Edit listing" link. NO identity check: the
+        # card whose "..." was clicked is the listing being edited, so
+        # this link is opened whatever its destination says (user's
+        # 2026-11-03 simplified rule — a mismatch is not a skip).
         edit_loc = S.to_playwright(page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
         try:
             edit_loc.wait_for(state="visible", timeout=15000)
@@ -3667,8 +3688,6 @@ class PlaywrightDriver(BaseDriver):
             href = ""
         if not href:
             return _skip("edit_link_not_found")
-        if str(listing_id) not in href:
-            return _skip("edit_link_mismatch")
         edit_url = (href if href.startswith("http")
                     else "https://www.facebook.com" + href)
         tab = self._context.new_page()

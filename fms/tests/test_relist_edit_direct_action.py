@@ -415,15 +415,25 @@ def test_playwright_fake_page_update_falls_back_to_save(monkeypatch):
 
 # --------------------------------------------- selling-page wait -----
 class _FakeSellingLink:
-    def __init__(self, href, title):
+    def __init__(self, href, title, visible=None):
         self._href = href
         self._title = title
+        # visible=None: visibility follows the page's poll count (late
+        # appearance); visible=True/False: fixed per-link visibility
+        # (e.g. a hidden first link with a visible second link).
+        self._visible_override = visible
+        self._poll_visible = True
 
     def get_attribute(self, name):
         return self._href if name == "href" else None
 
     def inner_text(self):
         return self._title
+
+    def is_visible(self):
+        if self._visible_override is not None:
+            return self._visible_override
+        return self._poll_visible
 
 
 class _FakeSellingFirst:
@@ -447,6 +457,12 @@ class _FakeSellingLocator:
         return _FakeSellingFirst(self._page)
 
     def all(self):
+        # One all() call = one visibility poll sweep, matching the
+        # production helper, which re-reads links on every poll.
+        self._page.all_calls += 1
+        for link in self._page.links:
+            link._poll_visible = (
+                self._page.all_calls > self._page.fail_wait_attempts)
         return list(self._page.links)
 
 
@@ -455,6 +471,7 @@ class _FakeSellingPage:
         self.links = links
         self.fail_wait_attempts = fail_wait_attempts
         self.wait_attempts = 0
+        self.all_calls = 0
         self.gotos = []
 
     def goto(self, url, wait_until=None, timeout=None):
@@ -483,7 +500,7 @@ def test_playwright_selling_page_late_links_found_in_order(monkeypatch):
     out = drv.relist_edit_get_selling_listings()
     assert [x["id"] for x in out] == ["111", "222"], out
     assert page.gotos == [SELLING_URL]
-    assert page.wait_attempts == 4, "3 failed polls + 1 successful poll"
+    assert page.all_calls == 4, "3 failed polls + 1 successful poll"
 
 
 def test_playwright_selling_page_visible_at_once(monkeypatch):
@@ -493,7 +510,42 @@ def test_playwright_selling_page_visible_at_once(monkeypatch):
     drv = _make_selling_driver(page, monkeypatch)
     out = drv.relist_edit_get_selling_listings()
     assert [x["id"] for x in out] == ["111"]
-    assert page.wait_attempts == 1, "no extra waiting once visible"
+    assert page.all_calls == 1, "no extra waiting once visible"
+
+
+def test_playwright_selling_page_hidden_first_link_does_not_block_start(
+        monkeypatch):
+    # The exact live failure: the FIRST link is hidden, the second is
+    # visible. The old first-link wait timed out and reported nothing;
+    # the new any-visible wait starts at once on the first VISIBLE
+    # listing, in page order, without waiting for the hidden one.
+    page = _FakeSellingPage(
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "Hidden", visible=False),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Visible", visible=True)])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["222"], out
+    assert page.all_calls == 1, "starts on the first visible listing at once"
+
+
+def test_playwright_selling_page_first_visible_starts_without_all_loaded(
+        monkeypatch):
+    # Any-visible start: the helper returns on the very first poll
+    # sweep in which any listing is visible — it does not wait for
+    # every listing, and it does not ask for confirmation.
+    page = _FakeSellingPage(
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "First"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Second"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/333/",
+                          "Third")])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111", "222", "333"], out
+    assert page.all_calls == 1
 
 
 def test_playwright_selling_page_never_visible_empty_only_after_bound(monkeypatch):
@@ -807,18 +859,25 @@ def test_playwright_menu_edit_link_without_href_skips(monkeypatch):
     assert drv._context.new_pages == 0
 
 
-def test_playwright_menu_edit_link_mismatch_skips_without_tab(monkeypatch):
+def test_playwright_menu_edit_link_mismatch_now_edited_not_skipped(
+        monkeypatch):
+    # REPLACES test_playwright_menu_edit_link_mismatch_skips_without_tab:
+    # the user deliberately removed the link-identity check on
+    # 2026-11-03 ("no need to identify the link"). The card whose
+    # "..." was clicked IS the listing being edited, so its menu's
+    # "Edit listing" link is opened even when its destination names a
+    # different listing id — no mismatch skip any more.
     page = _menu_page()
-    # First card's menu points at a DIFFERENT listing: must never edit
-    # the wrong listing, and must not fall back to the direct URL.
     page.edit_hrefs = [EDIT_URL + "L2&from_menu=1",
                        EDIT_URL + "L2&from_menu=1"]
     tab = _FakeTab(price_value="100")
     drv = _make_menu_driver(page, [tab], monkeypatch)
     res = drv.relist_edit_listing_price_via_menu("L1", "descending", 3)
-    assert res["ok"] is False and res["reason"] == "edit_link_mismatch"
-    assert drv._context.new_pages == 0, "no tab, no silent direct fallback"
-    assert tab.fills == []
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L2&from_menu=1"], tab.gotos
+    assert tab.fills == ["", "97"], "price written via the menu link's tab"
+    assert tab.closed is True
+    assert page.menu_clicks == [0], "first card's ... button clicked"
 
 
 def test_playwright_menu_second_listing_after_first_tab_closes(monkeypatch):
@@ -870,6 +929,21 @@ def test_engine_prefers_menu_path_and_keeps_count_direction_clamp():
     assert ("menu_edit", "L2") in drv.events
     # Descending 3 from 2 clamps at 1; L2: 100 -> 97.
     assert drv.writes == [("L1", 2.0, 1.0), ("L2", 100.0, 97.0)]
+
+
+def test_engine_processes_listings_strictly_in_order_one_after_another():
+    # Simplified start: no confirmation, no gate — L1 finishes, then
+    # L2 starts, then L3, strictly in page order, until the count is
+    # done. (Tab-close sequencing is proved by the playwright test
+    # test_playwright_menu_second_listing_after_first_tab_closes.)
+    drv = _MenuFakeDriver([{"id": "L1"}, {"id": "L2"}, {"id": "L3"}],
+                          {"L1": 100.0, "L2": 50.0, "L3": 30.0})
+    ctl = make_controller(3, 3)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert [e[1] for e in drv.events if e[0] == "menu_edit"] == [
+        "L1", "L2", "L3"]
+    assert drv.writes == [("L1", 100.0, 97.0), ("L2", 50.0, 47.0),
+                          ("L3", 30.0, 27.0)]
 
 
 def test_engine_menu_skip_continues_to_next_listing():

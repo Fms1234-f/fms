@@ -2291,6 +2291,14 @@ class RunController:
         trusting the short pause in the shared get_my_listings(). Drivers
         without that method fall back to get_my_listings(). No other
         action uses this wait, and the shared method is unchanged.
+        Simplified start (2026-11-03, Relist & Edit ONLY, supersedes
+        the old checks on this point): as soon as ANY listing is
+        visible on the selling page, work starts at once on the first
+        visible listing in page order — no confirmation, no safety
+        gate, and NO link-identity verification in the menu step. The
+        card whose "..." was clicked is the listing being edited.
+        After one listing is done, the next listing in order starts
+        straight away, until the Min-Max count is done.
         Menu navigation (2026-11-02, Relist & Edit ONLY): each listing's
         edit form is reached through its selling-page card's "..." menu
         ("Edit listing" opened in a new tab), not by a direct edit URL.
