@@ -3395,30 +3395,13 @@ class PlaywrightDriver(BaseDriver):
         return out
 
     def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
-        """Relist & Edit ONLY: read the selling page, starting the moment
-        ANY listing is actually VISIBLE — no confirmation, no safety
-        gate, no waiting for every listing. Card-based discovery
-        (2026-11-03, after the v0.2.193 live test still found nothing):
-        on the real selling page the listings are NOT found as visible
-        item links, so listings are now discovered by their card "..."
-        (more-actions) buttons in page order — the card whose "..."
-        was clicked IS the listing being edited — and item links are
-        kept ONLY as a fallback when no "..." button is visible. Poll
-        up to timeout_s seconds (default 30); the bound applies only
-        while nothing is visible, and the returned list starts at the
-        FIRST VISIBLE card, so work starts there at once. A card with
-        a paired item link (same page position) keeps that link's id;
-        a card without one is identified by its button position
-        ("card:<index>"), which the menu step resolves back to the
-        same "..." button. Used ONLY by the Relist & Edit direct
-        flow. The shared get_my_listings() is deliberately NOT changed,
-        because other actions (legacy Delete & Relist, Relist, script
-        blocks, delete-duplicates) also call it and must keep their old
-        behaviour. A page with nothing visible by the deadline is
-        reported as empty (never a crash), and the last sweep's counts
-        are left on self.relist_edit_last_discovery (path, visible
-        "..." buttons, item links visible/total, page URL and title)
-        so the engine can log real evidence instead of a guess."""
+        """Relist & Edit ONLY: begin as soon as a selling listing is visible.
+        If the first viewport has no listing yet, scroll the selling page
+        incrementally while checking for visible card buttons/item links.
+        No confirmation, approval, or safety gate is used. Return the
+        first visible listing(s) in page order immediately; card buttons
+        are preferred and item links remain the fallback. Scrolling and
+        discovery are confined to this Relist & Edit helper."""
         self._ensure()
         page = self._page
         assert page is not None
@@ -3429,10 +3412,19 @@ class PlaywrightDriver(BaseDriver):
         out: list[dict] = []
         try:
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
+            # Give the selling page a chance to finish its initial navigation.
+            # Do not block on network-idle: Facebook can keep background
+            # requests open. Listing visibility, not a confirmation gate,
+            # controls when discovery returns.
+            try:
+                page.wait_for_load_state("load", timeout=15000)
+            except Exception:
+                pass
             links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
             buttons_loc = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1])
             deadline = time.time() + max(0.0, float(timeout_s))
-            while time.time() < deadline:
+            last_scroll = 0.0
+            while time.time() <= deadline:
                 try:
                     link_handles = links_loc.all()
                 except Exception:
@@ -3472,45 +3464,34 @@ class PlaywrightDriver(BaseDriver):
                 except Exception:
                     pass
                 try:
-                    self.relist_edit_last_discovery["title"] = (
-                        page.title() or "")
+                    self.relist_edit_last_discovery["title"] = page.title() or ""
                 except Exception:
                     pass
                 if buttons_visible_idx is not None:
-                    # Card path: one entry per "..." button from the
-                    # first visible button onward, in page order.
                     self.relist_edit_last_discovery["path"] = "card_buttons"
                     seen: set[str] = set()
                     for btn_idx in range(buttons_visible_idx,
-                                         min(len(button_handles),
-                                             buttons_visible_idx + 50)):
+                                         min(len(button_handles), buttons_visible_idx + 50)):
                         lid = None
                         title = ""
                         if btn_idx < len(link_handles):
                             try:
-                                href = (link_handles[btn_idx]
-                                        .get_attribute("href") or "")
+                                href = link_handles[btn_idx].get_attribute("href") or ""
                             except Exception:
                                 href = ""
                             if "/marketplace/item/" in href:
-                                lid = (href.rstrip("/").split("/")[-1]
-                                       .split("?")[0])
+                                lid = href.rstrip("/").split("/")[-1].split("?")[0]
                                 try:
-                                    title = (link_handles[btn_idx]
-                                             .inner_text() or ""
-                                             ).strip()[:120]
+                                    title = (link_handles[btn_idx].inner_text() or "").strip()[:120]
                                 except Exception:
                                     title = ""
                         if not lid:
                             lid = f"card:{btn_idx}"
                         if lid not in seen:
                             seen.add(lid)
-                            out.append({"id": lid, "title": title,
-                                        "card_index": btn_idx})
+                            out.append({"id": lid, "title": title, "card_index": btn_idx})
                     return out
                 if links_visible_idx is not None:
-                    # Fallback path: no "..." buttons visible, but item
-                    # links are — the pre-0.2.194 behaviour, unchanged.
                     self.relist_edit_last_discovery["path"] = "item_links"
                     seen = set()
                     for link in link_handles[links_visible_idx:][:50]:
@@ -3524,15 +3505,24 @@ class PlaywrightDriver(BaseDriver):
                         if lid and lid not in seen:
                             seen.add(lid)
                             try:
-                                title = (link.inner_text() or ""
-                                         ).strip()[:120]
+                                title = (link.inner_text() or "").strip()[:120]
                             except Exception:
                                 title = ""
                             out.append({"id": lid, "title": title})
                     return out
-                if time.time() >= deadline:
-                    break
-                time.sleep(0.25)
+                # No listing visible yet: scroll to trigger lazy-loaded cards,
+                # then immediately re-scan. No approval or safety prompt.
+                now = time.time()
+                if now - last_scroll >= 0.8:
+                    try:
+                        page.mouse.wheel(0, 550)
+                    except Exception:
+                        try:
+                            page.evaluate("window.scrollBy(0, 550)")
+                        except Exception:
+                            pass
+                    last_scroll = now
+                time.sleep(0.2)
         except Exception:
             pass
         return out
