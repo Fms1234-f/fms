@@ -3397,66 +3397,142 @@ class PlaywrightDriver(BaseDriver):
     def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
         """Relist & Edit ONLY: read the selling page, starting the moment
         ANY listing is actually VISIBLE — no confirmation, no safety
-        gate, no waiting for every listing. This is the simplified start
-        the user ordered on 2026-11-03, replacing the old "first link
-        visible" wait that timed out on the real selling page even
-        though listings existed (a hidden first link blocked the whole
-        read). Poll up to timeout_s seconds (default 30) for any
-        visible listing link; the returned list starts at the FIRST
-        VISIBLE listing in page order, so work starts there at once.
-        Used ONLY by the Relist & Edit direct flow. The shared
-        get_my_listings() is deliberately NOT changed, because other
-        actions (legacy Delete & Relist, Relist, script blocks,
-        delete-duplicates) also call it and must keep their old
-        behaviour. Same link parsing, order and 50 cap as
-        get_my_listings(); a page with nothing visible by the deadline
-        is reported as empty (never a crash)."""
+        gate, no waiting for every listing. Card-based discovery
+        (2026-11-03, after the v0.2.193 live test still found nothing):
+        on the real selling page the listings are NOT found as visible
+        item links, so listings are now discovered by their card "..."
+        (more-actions) buttons in page order — the card whose "..."
+        was clicked IS the listing being edited — and item links are
+        kept ONLY as a fallback when no "..." button is visible. Poll
+        up to timeout_s seconds (default 30); the bound applies only
+        while nothing is visible, and the returned list starts at the
+        FIRST VISIBLE card, so work starts there at once. A card with
+        a paired item link (same page position) keeps that link's id;
+        a card without one is identified by its button position
+        ("card:<index>"), which the menu step resolves back to the
+        same "..." button. Used ONLY by the Relist & Edit direct
+        flow. The shared get_my_listings() is deliberately NOT changed,
+        because other actions (legacy Delete & Relist, Relist, script
+        blocks, delete-duplicates) also call it and must keep their old
+        behaviour. A page with nothing visible by the deadline is
+        reported as empty (never a crash), and the last sweep's counts
+        are left on self.relist_edit_last_discovery (path, visible
+        "..." buttons, item links visible/total, page URL and title)
+        so the engine can log real evidence instead of a guess."""
         self._ensure()
         page = self._page
         assert page is not None
+        self.relist_edit_last_discovery = {
+            "path": "none", "buttons_visible": 0, "buttons_total": 0,
+            "links_visible": 0, "links_total": 0, "url": "", "title": "",
+        }
         out: list[dict] = []
         try:
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
-            links = page.locator(S.SCR_MY_LISTING_LINKS[1])
+            links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
+            buttons_loc = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1])
             deadline = time.time() + max(0.0, float(timeout_s))
-            visible_handles = None
-            visible_idx = None
             while time.time() < deadline:
                 try:
-                    handles = links.all()
+                    link_handles = links_loc.all()
                 except Exception:
-                    handles = []
-                for i, handle in enumerate(handles):
+                    link_handles = []
+                try:
+                    button_handles = buttons_loc.all()
+                except Exception:
+                    button_handles = []
+                links_visible_idx = None
+                buttons_visible_idx = None
+                links_visible = 0
+                for i, handle in enumerate(link_handles):
                     try:
                         if handle.is_visible():
-                            visible_handles = handles
-                            visible_idx = i
-                            break
+                            links_visible += 1
+                            if links_visible_idx is None:
+                                links_visible_idx = i
                     except Exception:
                         continue
-                if visible_idx is not None:
-                    break
+                buttons_visible = 0
+                for i, handle in enumerate(button_handles):
+                    try:
+                        if handle.is_visible():
+                            buttons_visible += 1
+                            if buttons_visible_idx is None:
+                                buttons_visible_idx = i
+                    except Exception:
+                        continue
+                self.relist_edit_last_discovery.update({
+                    "buttons_visible": buttons_visible,
+                    "buttons_total": len(button_handles),
+                    "links_visible": links_visible,
+                    "links_total": len(link_handles),
+                })
+                try:
+                    self.relist_edit_last_discovery["url"] = page.url or ""
+                except Exception:
+                    pass
+                try:
+                    self.relist_edit_last_discovery["title"] = (
+                        page.title() or "")
+                except Exception:
+                    pass
+                if buttons_visible_idx is not None:
+                    # Card path: one entry per "..." button from the
+                    # first visible button onward, in page order.
+                    self.relist_edit_last_discovery["path"] = "card_buttons"
+                    seen: set[str] = set()
+                    for btn_idx in range(buttons_visible_idx,
+                                         min(len(button_handles),
+                                             buttons_visible_idx + 50)):
+                        lid = None
+                        title = ""
+                        if btn_idx < len(link_handles):
+                            try:
+                                href = (link_handles[btn_idx]
+                                        .get_attribute("href") or "")
+                            except Exception:
+                                href = ""
+                            if "/marketplace/item/" in href:
+                                lid = (href.rstrip("/").split("/")[-1]
+                                       .split("?")[0])
+                                try:
+                                    title = (link_handles[btn_idx]
+                                             .inner_text() or ""
+                                             ).strip()[:120]
+                                except Exception:
+                                    title = ""
+                        if not lid:
+                            lid = f"card:{btn_idx}"
+                        if lid not in seen:
+                            seen.add(lid)
+                            out.append({"id": lid, "title": title,
+                                        "card_index": btn_idx})
+                    return out
+                if links_visible_idx is not None:
+                    # Fallback path: no "..." buttons visible, but item
+                    # links are — the pre-0.2.194 behaviour, unchanged.
+                    self.relist_edit_last_discovery["path"] = "item_links"
+                    seen = set()
+                    for link in link_handles[links_visible_idx:][:50]:
+                        try:
+                            href = link.get_attribute("href") or ""
+                        except Exception:
+                            continue
+                        if "/marketplace/item/" not in href:
+                            continue
+                        lid = href.rstrip("/").split("/")[-1].split("?")[0]
+                        if lid and lid not in seen:
+                            seen.add(lid)
+                            try:
+                                title = (link.inner_text() or ""
+                                         ).strip()[:120]
+                            except Exception:
+                                title = ""
+                            out.append({"id": lid, "title": title})
+                    return out
                 if time.time() >= deadline:
                     break
                 time.sleep(0.25)
-            if visible_idx is None or visible_handles is None:
-                return []
-            seen: set[str] = set()
-            for link in visible_handles[visible_idx:][:50]:
-                try:
-                    href = link.get_attribute("href") or ""
-                except Exception:
-                    continue
-                if "/marketplace/item/" not in href:
-                    continue
-                lid = href.rstrip("/").split("/")[-1].split("?")[0]
-                if lid and lid not in seen:
-                    seen.add(lid)
-                    try:
-                        title = (link.inner_text() or "").strip()[:120]
-                    except Exception:
-                        title = ""
-                    out.append({"id": lid, "title": title})
         except Exception:
             pass
         return out
@@ -3614,7 +3690,10 @@ class PlaywrightDriver(BaseDriver):
         faithful automation equivalent of the user's right-click ->
         "Open link in new tab" (the browser's native context menu is
         browser UI, not page content, and cannot itself be clicked by
-        automation). Simplified 2026-11-03, per the user's order: NO
+        automation). Card-token listings ("card:<index>", 2026-11-03
+        card-button discovery) skip the link lookup and click the
+        "..." button at that position directly. Simplified 2026-11-03,
+        per the user's order: NO
         link-identity verification — the card whose "..." was clicked
         IS the listing being edited, so its menu's "Edit listing" link
         is opened whatever its destination says; a destination that
@@ -3639,28 +3718,40 @@ class PlaywrightDriver(BaseDriver):
                     "reason": reason}
 
         # 1. Re-find this listing's card on the selling page, at its turn.
-        try:
-            links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
-            handles = links_loc.all()
-        except Exception:
-            handles = []
+        # Card-token listings ("card:<button index>", from card-button
+        # discovery when the card has no item link) resolve straight
+        # to that "..." button's position — no link lookup is possible
+        # or needed for them; the clicked card IS the listing.
+        card_token = str(listing_id).startswith("card:")
         idx = None
-        for i, handle in enumerate(handles):
+        if card_token:
             try:
-                href = handle.get_attribute("href") or ""
+                idx = int(str(listing_id)[5:])
             except Exception:
-                continue
-            if (f"/marketplace/item/{listing_id}/" in href
-                    or href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-                    == str(listing_id)):
-                idx = i
-                break
+                idx = None
+        else:
+            try:
+                links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
+                handles = links_loc.all()
+            except Exception:
+                handles = []
+            for i, handle in enumerate(handles):
+                try:
+                    href = handle.get_attribute("href") or ""
+                except Exception:
+                    continue
+                if (f"/marketplace/item/{listing_id}/" in href
+                        or href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+                        == str(listing_id)):
+                    idx = i
+                    break
         if idx is None:
             return _skip("card_not_found")
-        try:
-            links_loc.nth(idx).wait_for(state="visible", timeout=15000)
-        except Exception:
-            return _skip("card_not_found")
+        if not card_token:
+            try:
+                links_loc.nth(idx).wait_for(state="visible", timeout=15000)
+            except Exception:
+                return _skip("card_not_found")
         # 2. That card's "..." button (one per card, same page order).
         try:
             buttons = page.locator(

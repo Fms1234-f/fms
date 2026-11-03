@@ -37,8 +37,15 @@ Covers the user-confirmed 2026-11-02 design, nothing else:
      automation, so the faithful equivalent is used and disclosed: the
      menu's "Edit listing" LINK is opened in a new tab. A menu-step
      failure skips that listing (no price written, no silent direct-URL
-     fallback) and the next listing is still processed; the menu link
-     is verified to belong to the listing being edited.
+     fallback) and the next listing is still processed.
+  10. Card-button discovery (2026-11-03, Relist & Edit ONLY): after
+     the v0.2.193 live test still found nothing, listings are
+     discovered by their card "..." buttons in page order (item links
+     only as a fallback), and a card without an item link is
+     identified by its button position ("card:<index>"), which the
+     menu step resolves back to the same button. An empty read logs
+     the discovery diagnostics (button/link counts, page URL/title)
+     instead of a bare "none found".
 No live Facebook is involved anywhere in this file.
 """
 import os
@@ -478,6 +485,13 @@ class _FakeSellingPage:
         self.gotos.append(url)
 
     def locator(self, sel):
+        # Selector-aware (0.2.194): the production helper now sweeps
+        # BOTH "..." buttons and item links per poll. The old fake
+        # returned the link handles for every selector, which would
+        # double-count polls; buttons are empty here (these tests
+        # prove the link path), links are the link handles.
+        if "..." in sel:
+            return _FakeCardCollection([])
         return _FakeSellingLocator(self)
 
 
@@ -560,6 +574,110 @@ def test_playwright_selling_page_never_visible_empty_only_after_bound(monkeypatc
     assert page.gotos == [SELLING_URL]
 
 
+# --------------------------------------- card-button discovery (0.2.194) -
+class _FakeCardButton:
+    def __init__(self, visible=True):
+        self._visible = visible
+
+    def is_visible(self):
+        return self._visible
+
+
+class _FakeCardCollection:
+    def __init__(self, handles):
+        self._handles = handles
+
+    def all(self):
+        return list(self._handles)
+
+
+class _FakeCardSellingPage:
+    """Selling page that dispatches by selector, so button discovery
+    can be proved separately from link discovery: "..." buttons and
+    item links are independent lists here."""
+
+    def __init__(self, buttons, links):
+        self.buttons = buttons
+        self.links = links
+        self.gotos = []
+        self.url = SELLING_URL
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.gotos.append(url)
+
+    def title(self):
+        return "Selling"
+
+    def locator(self, sel):
+        if "/marketplace/item/" in sel:
+            return _FakeCardCollection(self.links)
+        if "..." in sel:
+            return _FakeCardCollection(self.buttons)
+        raise AssertionError(f"unexpected selector {sel!r}")
+
+
+def test_playwright_selling_page_card_buttons_without_links_found_in_order(
+        monkeypatch):
+    # The exact v0.2.193 live failure: cards exist but there are NO
+    # item links at all. Discovery must start at the first card's
+    # "..." button and proceed in button order, L1 -> L2 -> L3.
+    page = _FakeCardSellingPage(
+        [_FakeCardButton(True), _FakeCardButton(True),
+         _FakeCardButton(True)], [])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["card:0", "card:1", "card:2"], out
+    assert [x["card_index"] for x in out] == [0, 1, 2], out
+    assert drv.relist_edit_last_discovery["path"] == "card_buttons"
+    assert page.gotos == [SELLING_URL]
+
+
+def test_playwright_selling_page_card_buttons_preferred_links_paired(
+        monkeypatch):
+    # Buttons visible AND links present: the card path wins, and a
+    # card's id still comes from its same-position item link.
+    page = _FakeCardSellingPage(
+        [_FakeCardButton(True), _FakeCardButton(True)],
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "First"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Second")])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111", "222"], out
+    assert drv.relist_edit_last_discovery["path"] == "card_buttons"
+
+
+def test_playwright_selling_page_fallback_links_without_buttons(
+        monkeypatch):
+    # No "..." buttons at all: the old item-link path still works.
+    page = _FakeCardSellingPage(
+        [],
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "First"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Second")])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111", "222"], out
+    assert drv.relist_edit_last_discovery["path"] == "item_links"
+
+
+def test_playwright_selling_page_neither_buttons_nor_links_diagnostics(
+        monkeypatch):
+    # Nothing visible: empty, but the discovery record carries real
+    # counts, URL and title for the engine's diagnostic log line.
+    page = _FakeCardSellingPage([], [])
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings(timeout_s=0.3)
+    assert out == []
+    diag = drv.relist_edit_last_discovery
+    assert diag["path"] == "none"
+    assert diag["buttons_visible"] == 0 and diag["buttons_total"] == 0
+    assert diag["links_visible"] == 0 and diag["links_total"] == 0
+    assert diag["url"] == SELLING_URL and diag["title"] == "Selling"
+
+
 class _ScopedFakeDriver(FakeDriver):
     """FakeDriver plus the Relist & Edit-scoped selling-page read.
 
@@ -616,6 +734,30 @@ def test_engine_never_visible_listings_is_done_after_wait_not_instant():
     ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
     assert time.time() - start >= 0.2
     assert drv.writes == []
+    assert any("No selling listings available" in m for m in ctl.logs)
+
+
+class _DiagEmptyScopedDriver(_ScopedFakeDriver):
+    def relist_edit_get_selling_listings(self):
+        # Empty read WITH a discovery record: the engine must log the
+        # diagnostic counts line before the Done line, not just "none
+        # found" with no evidence.
+        self.relist_edit_last_discovery = {
+            "path": "none", "buttons_visible": 0, "buttons_total": 0,
+            "links_visible": 0, "links_total": 0,
+            "url": SELLING_URL, "title": "Selling"}
+        self.events.append(("relist_edit_selling_listings",))
+        return []
+
+
+def test_engine_empty_read_logs_discovery_diagnostics():
+    drv = _DiagEmptyScopedDriver([], {})
+    ctl = make_controller(1, 3)
+    ctl._relist_edit_direct_flow({"id": 9, "label": "Acct"}, drv)
+    assert drv.writes == []
+    assert any("Relist & Edit discovery:" in m
+               and "buttons 0/0" in m and "item links 0/0" in m
+               and SELLING_URL in m for m in ctl.logs), ctl.logs
     assert any("No selling listings available" in m for m in ctl.logs)
 
 
@@ -901,6 +1043,21 @@ def test_playwright_menu_card_not_found_skips(monkeypatch):
     res = drv.relist_edit_listing_price_via_menu("L9", "descending", 3)
     assert res["ok"] is False and res["reason"] == "card_not_found"
     assert drv._context.new_pages == 0
+
+
+def test_playwright_menu_card_token_clicks_button_at_that_position(
+        monkeypatch):
+    # Card-button discovery without an item link: "card:1" clicks the
+    # SECOND card's "..." button and opens ITS menu link — no link
+    # lookup is attempted for a card token.
+    page = _menu_page()
+    tab = _FakeTab(price_value="50")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:1", "ascending", 2)
+    assert res["ok"] is True and res["new_price"] == 52.0
+    assert tab.gotos == [EDIT_URL + "L2&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [1], "second card's ... button clicked"
+    assert tab.closed is True
 
 
 class _MenuFakeDriver(FakeDriver):

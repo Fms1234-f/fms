@@ -2297,6 +2297,13 @@ class RunController:
         visible listing in page order — no confirmation, no safety
         gate, and NO link-identity verification in the menu step. The
         card whose "..." was clicked is the listing being edited.
+        Card-based discovery (2026-11-03, after the v0.2.193 live test
+        still found nothing): listings are discovered by their card
+        "..." buttons in page order, with item links only as a
+        fallback; if nothing is found, the engine logs the discovery
+        diagnostics (visible "..." buttons, item links visible/total,
+        page URL and title) so the next step has evidence, not a
+        guess. The empty case still ends Done, never a crash.
         After one listing is done, the next listing in order starts
         straight away, until the Min-Max count is done.
         Menu navigation (2026-11-02, Relist & Edit ONLY): each listing's
@@ -2345,10 +2352,24 @@ class RunController:
         else:
             listings = driver.get_my_listings() or []
         targets = [lst for lst in listings if lst.get("id")][:want]
+        diag = getattr(driver, "relist_edit_last_discovery", None)
         if not targets:
+            if isinstance(diag, dict) and diag.get("path") is not None:
+                self.log(f"[{label}] Relist & Edit discovery: "
+                         f"visible '...' buttons {diag.get('buttons_visible')}"
+                         f"/{diag.get('buttons_total')}, item links "
+                         f"{diag.get('links_visible')}"
+                         f"/{diag.get('links_total')} visible/total, "
+                         f"page {diag.get('url') or '?'} "
+                         f"({diag.get('title') or '?'})",
+                         account_id=account["id"])
             self.log(f"[{label}] No selling listings available to edit; account marked Done",
                      account_id=account["id"])
             return
+        if isinstance(diag, dict) and diag.get("path"):
+            self.log(f"[{label}] Relist & Edit: selling listings found via "
+                     f"{diag.get('path')} ({len(targets)} card(s))",
+                     account_id=account["id"])
         edited = 0
         failed = 0
         for lst in targets:
