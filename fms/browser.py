@@ -3395,13 +3395,15 @@ class PlaywrightDriver(BaseDriver):
         return out
 
     def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
-        """Relist & Edit ONLY: begin as soon as a selling listing is visible.
-        If the first viewport has no listing yet, scroll the selling page
-        incrementally while checking for visible card buttons/item links.
-        No confirmation, approval, or safety gate is used. Return the
-        first visible listing(s) in page order immediately; card buttons
-        are preferred and item links remain the fallback. Scrolling and
-        discovery are confined to this Relist & Edit helper."""
+        """Relist & Edit ONLY: discover listing links without blind scrolling.
+
+        Read listing links in Facebook's DOM/page order, including links
+        outside the current viewport. Do not wheel-scroll or repeatedly
+        scan the page. The menu step scrolls only the specific target link
+        into view immediately before clicking that listing's own "..."
+        button. If Facebook exposes no item links, visible card menu buttons
+        remain a conservative fallback. No confirmation or safety gate.
+        """
         self._ensure()
         page = self._page
         assert page is not None
@@ -3412,117 +3414,83 @@ class PlaywrightDriver(BaseDriver):
         out: list[dict] = []
         try:
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
-            # Give the selling page a chance to finish its initial navigation.
-            # Do not block on network-idle: Facebook can keep background
-            # requests open. Listing visibility, not a confirmation gate,
-            # controls when discovery returns.
             try:
                 page.wait_for_load_state("load", timeout=15000)
             except Exception:
                 pass
-            links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
-            buttons_loc = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1])
-            deadline = time.time() + max(0.0, float(timeout_s))
-            last_scroll = 0.0
-            while time.time() <= deadline:
+
+            # First identify actual Marketplace item links in DOM order.
+            # Do not scroll to discover them; off-viewport DOM links are valid
+            # targets and are scrolled into view individually at processing time.
+            try:
+                link_handles = page.locator(S.SCR_MY_LISTING_LINKS[1]).all()
+            except Exception:
+                link_handles = []
+            seen: set[str] = set()
+            visible_links = 0
+            for link in link_handles[:200]:
                 try:
-                    link_handles = links_loc.all()
+                    href = link.get_attribute("href") or ""
                 except Exception:
-                    link_handles = []
+                    continue
+                if "/marketplace/item/" not in href:
+                    continue
+                lid = href.rstrip("/").split("/")[-1].split("?")[0]
+                if not lid or lid in seen:
+                    continue
+                seen.add(lid)
                 try:
-                    button_handles = buttons_loc.all()
+                    title = (link.inner_text() or "").strip()[:120]
                 except Exception:
-                    button_handles = []
-                links_visible_idx = None
-                buttons_visible_idx = None
-                links_visible = 0
-                for i, handle in enumerate(link_handles):
-                    try:
-                        if handle.is_visible():
-                            links_visible += 1
-                            if links_visible_idx is None:
-                                links_visible_idx = i
-                    except Exception:
-                        continue
-                buttons_visible = 0
-                for i, handle in enumerate(button_handles):
-                    try:
-                        if handle.is_visible():
-                            buttons_visible += 1
-                            if buttons_visible_idx is None:
-                                buttons_visible_idx = i
-                    except Exception:
-                        continue
+                    title = ""
+                try:
+                    if link.is_visible():
+                        visible_links += 1
+                except Exception:
+                    pass
+                out.append({"id": lid, "title": title})
+
+            # Diagnostics are scoped to this action and make empty discovery
+            # distinguishable from a page with DOM links below the viewport.
+            try:
+                buttons = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
+            except Exception:
+                buttons = []
+            buttons_visible = 0
+            for button in buttons:
+                try:
+                    if button.is_visible():
+                        buttons_visible += 1
+                except Exception:
+                    pass
+            try:
                 self.relist_edit_last_discovery.update({
-                    "buttons_visible": buttons_visible,
-                    "buttons_total": len(button_handles),
-                    "links_visible": links_visible,
+                    "links_visible": visible_links,
                     "links_total": len(link_handles),
+                    "buttons_visible": buttons_visible,
+                    "buttons_total": len(buttons),
+                    "url": page.url or "",
+                    "title": page.title() or "",
                 })
+            except Exception:
+                pass
+
+            if out:
+                self.relist_edit_last_discovery["path"] = "item_links_dom_order"
+                return out[:50]
+
+            # Fallback only to buttons already visible; never wheel-scroll
+            # hoping that an unknown listing will appear.
+            for idx, button in enumerate(buttons):
                 try:
-                    self.relist_edit_last_discovery["url"] = page.url or ""
+                    if button.is_visible():
+                        out.append({"id": f"card:{idx}", "title": "",
+                                    "card_index": idx})
                 except Exception:
-                    pass
-                try:
-                    self.relist_edit_last_discovery["title"] = page.title() or ""
-                except Exception:
-                    pass
-                if buttons_visible_idx is not None:
-                    self.relist_edit_last_discovery["path"] = "card_buttons"
-                    seen: set[str] = set()
-                    for btn_idx in range(buttons_visible_idx,
-                                         min(len(button_handles), buttons_visible_idx + 50)):
-                        lid = None
-                        title = ""
-                        if btn_idx < len(link_handles):
-                            try:
-                                href = link_handles[btn_idx].get_attribute("href") or ""
-                            except Exception:
-                                href = ""
-                            if "/marketplace/item/" in href:
-                                lid = href.rstrip("/").split("/")[-1].split("?")[0]
-                                try:
-                                    title = (link_handles[btn_idx].inner_text() or "").strip()[:120]
-                                except Exception:
-                                    title = ""
-                        if not lid:
-                            lid = f"card:{btn_idx}"
-                        if lid not in seen:
-                            seen.add(lid)
-                            out.append({"id": lid, "title": title, "card_index": btn_idx})
-                    return out
-                if links_visible_idx is not None:
-                    self.relist_edit_last_discovery["path"] = "item_links"
-                    seen = set()
-                    for link in link_handles[links_visible_idx:][:50]:
-                        try:
-                            href = link.get_attribute("href") or ""
-                        except Exception:
-                            continue
-                        if "/marketplace/item/" not in href:
-                            continue
-                        lid = href.rstrip("/").split("/")[-1].split("?")[0]
-                        if lid and lid not in seen:
-                            seen.add(lid)
-                            try:
-                                title = (link.inner_text() or "").strip()[:120]
-                            except Exception:
-                                title = ""
-                            out.append({"id": lid, "title": title})
-                    return out
-                # No listing visible yet: scroll to trigger lazy-loaded cards,
-                # then immediately re-scan. No approval or safety prompt.
-                now = time.time()
-                if now - last_scroll >= 0.8:
-                    try:
-                        page.mouse.wheel(0, 550)
-                    except Exception:
-                        try:
-                            page.evaluate("window.scrollBy(0, 550)")
-                        except Exception:
-                            pass
-                    last_scroll = now
-                time.sleep(0.2)
+                    continue
+            if out:
+                self.relist_edit_last_discovery["path"] = "visible_card_buttons"
+                return out[:50]
         except Exception:
             pass
         return out
@@ -3707,53 +3675,70 @@ class PlaywrightDriver(BaseDriver):
                     "current_price": None, "new_price": None,
                     "reason": reason}
 
-        # 1. Re-find this listing's card on the selling page, at its turn.
-        # Card-token listings ("card:<button index>", from card-button
-        # discovery when the card has no item link) resolve straight
-        # to that "..." button's position — no link lookup is possible
-        # or needed for them; the clicked card IS the listing.
+        # 1. Resolve this exact listing link, then its own card container.
+        # For link-backed listings, never pair unrelated page-wide link and
+        # button indexes: locate the nearest ancestor containing the card's
+        # ellipsis button. Scroll only this target link if it is off-screen.
         card_token = str(listing_id).startswith("card:")
-        idx = None
         if card_token:
             try:
                 idx = int(str(listing_id)[5:])
+                buttons = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
+                target_button = buttons[idx]
             except Exception:
-                idx = None
+                return _skip("menu_button_not_found")
+            try:
+                human.human_click(page, target_button)
+            except Exception:
+                return _skip("menu_button_not_found")
         else:
             try:
                 links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
                 handles = links_loc.all()
             except Exception:
                 handles = []
+            target_link = None
             for i, handle in enumerate(handles):
                 try:
                     href = handle.get_attribute("href") or ""
                 except Exception:
                     continue
-                if (f"/marketplace/item/{listing_id}/" in href
-                        or href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-                        == str(listing_id)):
-                    idx = i
+                found_id = (href.rstrip("/").rsplit("/", 1)[-1]
+                            .split("?")[0])
+                if found_id == str(listing_id):
+                    target_link = links_loc.nth(i)
                     break
-        if idx is None:
-            return _skip("card_not_found")
-        if not card_token:
-            try:
-                links_loc.nth(idx).wait_for(state="visible", timeout=15000)
-            except Exception:
+            if target_link is None:
                 return _skip("card_not_found")
-        # 2. That card's "..." button (one per card, same page order).
-        try:
-            buttons = page.locator(
-                S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
-        except Exception:
-            buttons = []
-        if idx >= len(buttons):
-            return _skip("menu_button_not_found")
-        try:
-            human.human_click(page, buttons[idx])
-        except Exception:
-            return _skip("menu_button_not_found")
+            try:
+                in_viewport = target_link.evaluate(
+                    "el => { const r = el.getBoundingClientRect(); "
+                    "return r.bottom > 0 && r.right > 0 && "
+                    "r.top < window.innerHeight && r.left < window.innerWidth; }"
+                )
+            except Exception:
+                in_viewport = False
+            if not in_viewport:
+                try:
+                    target_link.scroll_into_view_if_needed(timeout=15000)
+                except Exception:
+                    return _skip("card_not_visible")
+            try:
+                card = target_link.locator(
+                    "xpath=ancestor::*[.//div[@role='button' and "
+                    "contains(normalize-space(.), '...')] or "
+                    ".//button[contains(normalize-space(.), '...')]][1]"
+                )
+                card_buttons = card.locator(
+                    S.F_RELIST_EDIT_CARD_MENU_BUTTON[1])
+                target_button = card_buttons.first
+                target_button.wait_for(state="visible", timeout=10000)
+            except Exception:
+                return _skip("menu_button_not_found")
+            try:
+                human.human_click(page, target_button)
+            except Exception:
+                return _skip("menu_button_not_found")
         # 3. The menu's "Edit listing" link. NO identity check: the
         # card whose "..." was clicked is the listing being edited, so
         # this link is opened whatever its destination says (user's
