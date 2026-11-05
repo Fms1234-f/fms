@@ -23,13 +23,14 @@ Covers the user-confirmed 2026-11-02 design, nothing else:
      runs-page product-tick list).
   8. Selling-page wait (2026-11-02, Relist & Edit ONLY): the direct flow
      reads listings through the Relist & Edit-scoped helper, which waits
-     until at least one listing link is actually visible (up to 30s on
-     the real driver) before reading. The shared get_my_listings() is
-     untouched, so no other action gains or loses this wait. Fake-page
-     tests prove the polling itself (late links found, never-visible
-     links reported empty only after the bound); engine doubles prove
-     the flow prefers the scoped helper and keeps first-listing order
-     and Min/Max count.
+     until at least one listing link is actually visible — with NO fixed
+     time bound on the real driver (user order 2026-11-05: however long
+     Facebook takes, 10 seconds or 10 minutes) before reading. The
+     shared get_my_listings() is untouched, so no other action gains or
+     loses this wait. Fake-page tests prove the polling itself (late
+     links found, never-visible links reported empty only after an
+     explicit test bound); engine doubles prove the flow prefers the
+     scoped helper and keeps first-listing order and Min/Max count.
   9. Card-menu navigation (2026-11-02, Relist & Edit ONLY): the edit
      form is reached through the selling-page card's "..." menu
      ("Edit listing" opened in a new tab), not by a direct edit URL.
@@ -566,11 +567,41 @@ def test_playwright_selling_page_never_visible_empty_only_after_bound(monkeypatc
     page = _FakeSellingPage([], fail_wait_attempts=10 ** 9)
     drv = _make_selling_driver(page, monkeypatch)
     start = time.time()
-    # Small bound keeps the test fast; the production default is 30s.
+    # Small bound keeps the test fast; the production default is
+    # unlimited (None) — the bound only exists when a caller passes one.
     out = drv.relist_edit_get_selling_listings(timeout_s=0.3)
     elapsed = time.time() - start
     assert out == []
     assert elapsed >= 0.3, f"gave up after {elapsed:.2f}s, before the bound"
+    assert page.gotos == [SELLING_URL]
+
+
+def test_playwright_selling_page_waits_past_old_30s_bound(monkeypatch):
+    # User order 2026-11-05: no fixed time on the selling-page load.
+    # Listings appear only after 91 failed polls (~45 simulated
+    # seconds) — past the old 30s deadline. A fake clock fast-forwards
+    # time so the test stays instant.
+    import time as _time
+    clock = {"now": 1000.0}
+
+    def _mono():
+        return clock["now"]
+
+    def _sleep(seconds):
+        clock["now"] += seconds
+
+    monkeypatch.setattr(_time, "monotonic", _mono)
+    monkeypatch.setattr(_time, "sleep", _sleep)
+    page = _FakeSellingPage(
+        [_FakeSellingLink("https://www.facebook.com/marketplace/item/111/",
+                          "First"),
+         _FakeSellingLink("https://www.facebook.com/marketplace/item/222/",
+                          "Second")],
+        fail_wait_attempts=91)
+    drv = _make_selling_driver(page, monkeypatch)
+    out = drv.relist_edit_get_selling_listings()
+    assert [x["id"] for x in out] == ["111", "222"], out
+    assert clock["now"] - 1000.0 > 30.0, "wait ended before the old bound"
     assert page.gotos == [SELLING_URL]
 
 

@@ -2287,8 +2287,10 @@ class RunController:
         Selling-page wait (2026-11-02, Relist & Edit ONLY): before reading
         listings, the flow uses the driver's Relist & Edit-scoped
         relist_edit_get_selling_listings(), which waits until at least
-        one listing is actually visible (up to 30 seconds) instead of
-        trusting the short pause in the shared get_my_listings(). Drivers
+        one listing is actually visible — with NO fixed time bound
+        (user order 2026-11-05): it waits however long Facebook
+        takes, 10 seconds or 10 minutes, instead of trusting the
+        short pause in the shared get_my_listings(). Drivers
         without that method fall back to get_my_listings(). No other
         action uses this wait, and the shared method is unchanged.
         Simplified start (2026-11-03, Relist & Edit ONLY, supersedes

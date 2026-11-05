@@ -3394,19 +3394,23 @@ class PlaywrightDriver(BaseDriver):
             pass
         return out
 
-    def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
+    def relist_edit_get_selling_listings(self, timeout_s: float | None = None) -> list[dict]:
         """Discover the account's own selling cards in page order.
 
         Facebook renders Marketplace cards asynchronously, and cards
         below the fold may only render when scrolled into view. Poll
-        until the FIRST card is actually rendered (bounded by
-        timeout_s), then run a controlled, incremental scroll-and-
-        rescan loop to pick up virtualized cards. Listings are
-        identified by their item-link id — never by a button index —
-        deduplicated, and kept in first-seen page order. Global/header
-        menu buttons never create listings: button-based entries come
-        only from the landmark-scoped selector, and only when no item
-        links exist at all. No confirmation step is used.
+        until the FIRST card is actually rendered — with NO fixed time
+        bound (user order 2026-11-05): the wait continues until a
+        listing is visible, whether Facebook takes 10 seconds or 10
+        minutes. A caller may still pass timeout_s for tests; None
+        (the production default) means unlimited. Then run a
+        controlled, incremental scroll-and-rescan loop to pick up
+        virtualized cards. Listings are identified by their item-link
+        id — never by a button index — deduplicated, and kept in
+        first-seen page order. Global/header menu buttons never
+        create listings: button-based entries come only from the
+        landmark-scoped selector, and only when no item links exist
+        at all. No confirmation step is used.
         """
         self._ensure()
         page = self._page
@@ -3419,9 +3423,14 @@ class PlaywrightDriver(BaseDriver):
         }
         out: list[dict] = []
         try:
+            # No fixed time on the selling-page load (user order
+            # 2026-11-05): goto has no timeout and the poll below has
+            # no deadline — it waits until a listing is actually
+            # visible, however long Facebook takes.
             page.goto(S.MKT_YOUR_LISTINGS_URL,
-                      wait_until="domcontentloaded", timeout=60000)
-            deadline = time.monotonic() + max(0.0, float(timeout_s))
+                      wait_until="domcontentloaded", timeout=0)
+            deadline = (None if timeout_s is None
+                        else time.monotonic() + max(0.0, float(timeout_s)))
 
             def _scan_links():
                 """Visible item links in DOM order: [(handle, id, title)]."""
@@ -3468,7 +3477,8 @@ class PlaywrightDriver(BaseDriver):
             # Poll until the first card is actually rendered. Do not wait
             # for the browser's full `load` event: Facebook's client-
             # rendered cards can appear after it. A transient empty DOM
-            # is NOT a result — only the deadline turns it into one.
+            # is NOT a result — only a listing becoming visible ends
+            # the wait (or the deadline, when a caller passed one).
             visible_links = []
             scoped_buttons = []
             while True:
@@ -3476,9 +3486,9 @@ class PlaywrightDriver(BaseDriver):
                 scoped_buttons = _scan_scoped_buttons()
                 if visible_links or scoped_buttons:
                     break
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     break
-                time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+                time.sleep(0.5)
 
             try:
                 self.relist_edit_last_discovery.update({
