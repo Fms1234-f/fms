@@ -2318,7 +2318,13 @@ class RunController:
         the run continues with the next listing; the account still ends
         Done. Returning without raising lets the worker close the browser
         and move to the next account, which restarts from its own first
-        listing."""
+        listing.
+        Discovery cap (2026-11-05): at most 200 listings are collected
+        (15 scroll passes, ID deduplication, first-seen order); the
+        50-listing return limit was removed, so a run is bounded only by
+        the Min-Max count and the 200 cap. If the cap is reached, the
+        run logs a warning — listings beyond the cap are never silently
+        treated as done."""
         label = account["label"]
         direction = str(self.cfg.relist_edit_price_direction or "").strip().lower()
         if direction not in ("ascending", "descending"):
@@ -2370,6 +2376,11 @@ class RunController:
             self.log(f"[{label}] Relist & Edit: selling listings found via "
                      f"{diag.get('path')} ({len(targets)} card(s))",
                      account_id=account["id"])
+        if isinstance(diag, dict) and diag.get("cap_reached"):
+            self.log(f"[{label}] Relist & Edit: discovery stopped at the "
+                     f"200-listing cap; listings beyond the cap, if any, "
+                     f"were not collected or processed",
+                     level="warning", account_id=account["id"])
         edited = 0
         failed = 0
         for lst in targets:

@@ -176,8 +176,38 @@ F_RELIST_EDIT_UPDATE_BUTTON = ("css", "div[aria-label='Update'][role='button'], 
 # menu's "Edit listing" LINK, and open THAT link's destination in a new
 # tab — the same edit form, in a new tab, reached through the menu, not
 # by constructing an edit URL from the listing id.
-F_RELIST_EDIT_CARD_MENU_BUTTON = ("css", "div[role='button']:has-text('...'), "
-                                        "button:has-text('...')")
+F_RELIST_EDIT_CARD_MENU_BUTTON = ("css",
+    "button[aria-label*='more' i], [role='button'][aria-label*='more' i], "
+    "button[aria-label*='option' i], [role='button'][aria-label*='option' i], "
+    "button[aria-label*='action' i], [role='button'][aria-label*='action' i], "
+    "button[aria-label*='menu' i], [role='button'][aria-label*='menu' i], "
+    "button[title*='more' i], [role='button'][title*='more' i], "
+    "div[role='button']:has-text('...'), button:has-text('...')")
+def _ci_contains(attr, word):
+    return (f"contains(translate({attr},'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            f"'abcdefghijklmnopqrstuvwxyz'),'{word}')")
+
+
+# Fragment: a menu button's accessible name/title, or its literal "..."
+# text. Shared by the Relist & Edit card-ancestor xpath (browser.py) and
+# the scoped selector below, so both use exactly the same definition.
+_RELIST_MENU_NAME_PRED = " or ".join(
+    [_ci_contains("@aria-label", w) for w in ("more", "option", "action", "menu")] +
+    [_ci_contains("@title", w) for w in ("more", "option", "action", "menu")] +
+    ["normalize-space(.)='...'"])
+F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED = (
+    "(self::button or @role='button') and (" + _RELIST_MENU_NAME_PRED + ")")
+# Relist & Edit ONLY (2026-11-05 correction): menu buttons excluding
+# global/header/toolbar controls. Fallback discovery and card-token
+# lookup use ONLY this collection, so an unrelated page button can
+# never become a fake listing or consume a Min-Max slot.
+F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED = (
+    "xpath",
+    "//*[" + F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED +
+    " and not(ancestor::header or ancestor::nav"
+    " or ancestor::*[@role='banner']"
+    " or ancestor::*[@role='navigation']"
+    " or ancestor::*[@role='toolbar'])]")
 F_RELIST_EDIT_MENU_EDIT_LINK = ("css", "a:has-text('Edit listing'), "
                                      "[role='menuitem']:has-text('Edit listing')")
 

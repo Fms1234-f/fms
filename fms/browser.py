@@ -3395,14 +3395,18 @@ class PlaywrightDriver(BaseDriver):
         return out
 
     def relist_edit_get_selling_listings(self, timeout_s: float = 30.0) -> list[dict]:
-        """Relist & Edit ONLY: discover listing links without blind scrolling.
+        """Discover the account's own selling cards in page order.
 
-        Read listing links in Facebook's DOM/page order, including links
-        outside the current viewport. Do not wheel-scroll or repeatedly
-        scan the page. The menu step scrolls only the specific target link
-        into view immediately before clicking that listing's own "..."
-        button. If Facebook exposes no item links, visible card menu buttons
-        remain a conservative fallback. No confirmation or safety gate.
+        Facebook renders Marketplace cards asynchronously, and cards
+        below the fold may only render when scrolled into view. Poll
+        until the FIRST card is actually rendered (bounded by
+        timeout_s), then run a controlled, incremental scroll-and-
+        rescan loop to pick up virtualized cards. Listings are
+        identified by their item-link id — never by a button index —
+        deduplicated, and kept in first-seen page order. Global/header
+        menu buttons never create listings: button-based entries come
+        only from the landmark-scoped selector, and only when no item
+        links exist at all. No confirmation step is used.
         """
         self._ensure()
         page = self._page
@@ -3410,89 +3414,143 @@ class PlaywrightDriver(BaseDriver):
         self.relist_edit_last_discovery = {
             "path": "none", "buttons_visible": 0, "buttons_total": 0,
             "links_visible": 0, "links_total": 0, "url": "", "title": "",
+            "scroll_passes": 0,
+            "cap_reached": False,
         }
         out: list[dict] = []
         try:
-            page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
-            try:
-                page.wait_for_load_state("load", timeout=15000)
-            except Exception:
-                pass
+            page.goto(S.MKT_YOUR_LISTINGS_URL,
+                      wait_until="domcontentloaded", timeout=60000)
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
 
-            # First identify actual Marketplace item links in DOM order.
-            # Do not scroll to discover them; off-viewport DOM links are valid
-            # targets and are scrolled into view individually at processing time.
-            try:
-                link_handles = page.locator(S.SCR_MY_LISTING_LINKS[1]).all()
-            except Exception:
-                link_handles = []
-            seen: set[str] = set()
-            visible_links = 0
-            for link in link_handles[:200]:
+            def _scan_links():
+                """Visible item links in DOM order: [(handle, id, title)]."""
                 try:
-                    href = link.get_attribute("href") or ""
+                    handles = page.locator(S.SCR_MY_LISTING_LINKS[1]).all()
                 except Exception:
-                    continue
-                if "/marketplace/item/" not in href:
-                    continue
-                lid = href.rstrip("/").split("/")[-1].split("?")[0]
-                if not lid or lid in seen:
-                    continue
-                seen.add(lid)
-                try:
-                    title = (link.inner_text() or "").strip()[:120]
-                except Exception:
-                    title = ""
-                try:
-                    if link.is_visible():
-                        visible_links += 1
-                except Exception:
-                    pass
-                out.append({"id": lid, "title": title})
+                    return []
+                found = []
+                for handle in handles[:200]:
+                    try:
+                        if not handle.is_visible():
+                            continue
+                        href = handle.get_attribute("href") or ""
+                    except Exception:
+                        continue
+                    if "/marketplace/item/" not in href:
+                        continue
+                    lid = href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+                    if not lid:
+                        continue
+                    try:
+                        title = (handle.inner_text() or "").strip()[:120]
+                    except Exception:
+                        title = ""
+                    found.append((handle, lid, title))
+                return found
 
-            # Diagnostics are scoped to this action and make empty discovery
-            # distinguishable from a page with DOM links below the viewport.
-            try:
-                buttons = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
-            except Exception:
-                buttons = []
-            buttons_visible = 0
-            for button in buttons:
+            def _scan_scoped_buttons():
+                """Visible landmark-scoped menu buttons in DOM order."""
                 try:
-                    if button.is_visible():
-                        buttons_visible += 1
+                    handles = page.locator(
+                        "xpath=" + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
                 except Exception:
-                    pass
+                    return []
+                visible = []
+                for handle in handles:
+                    try:
+                        if handle.is_visible():
+                            visible.append(handle)
+                    except Exception:
+                        continue
+                return visible
+
+            # Poll until the first card is actually rendered. Do not wait
+            # for the browser's full `load` event: Facebook's client-
+            # rendered cards can appear after it. A transient empty DOM
+            # is NOT a result — only the deadline turns it into one.
+            visible_links = []
+            scoped_buttons = []
+            while True:
+                visible_links = _scan_links()
+                scoped_buttons = _scan_scoped_buttons()
+                if visible_links or scoped_buttons:
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+
             try:
                 self.relist_edit_last_discovery.update({
-                    "links_visible": visible_links,
-                    "links_total": len(link_handles),
-                    "buttons_visible": buttons_visible,
-                    "buttons_total": len(buttons),
+                    "links_visible": len(visible_links),
+                    "buttons_visible": len(scoped_buttons),
                     "url": page.url or "",
                     "title": page.title() or "",
                 })
             except Exception:
                 pass
 
-            if out:
-                self.relist_edit_last_discovery["path"] = "item_links_dom_order"
-                return out[:50]
+            if visible_links:
+                # Link-driven discovery: ids are stable across re-renders,
+                # so scrolling + rescanning can only ADD listings, never
+                # re-identify one. Dedupe by id, keep first-seen order.
+                seen = set()
+                for _handle, lid, title in visible_links:
+                    if lid in seen:
+                        continue
+                    seen.add(lid)
+                    out.append({"id": lid, "title": title,
+                                "card_index": len(out)})
+                # Controlled incremental scroll: one wheel step, settle,
+                # rescan. Stop when a full pass adds nothing, or at the
+                # pass/total caps — never an unbounded loop.
+                passes = 0
+                while passes < 15 and len(out) < 200:
+                    try:
+                        page.mouse.wheel(0, 1200)
+                    except Exception:
+                        break
+                    time.sleep(0.6)
+                    passes += 1
+                    added = 0
+                    for _handle, lid, title in _scan_links():
+                        if lid in seen:
+                            continue
+                        seen.add(lid)
+                        out.append({"id": lid, "title": title,
+                                    "card_index": len(out)})
+                        added += 1
+                    if added == 0:
+                        break
+                self.relist_edit_last_discovery.update({
+                    "scroll_passes": passes,
+                    "links_total": len(out),
+                    # The 200 cap is the only bound now: reaching it means
+                    # collection stopped there, so the engine must report
+                    # it instead of silently treating the rest as done.
+                    "cap_reached": len(out) >= 200,
+                })
+                if out:
+                    self.relist_edit_last_discovery["path"] = "item_links"
+                return out
 
-            # Fallback only to buttons already visible; never wheel-scroll
-            # hoping that an unknown listing will appear.
-            for idx, button in enumerate(buttons):
-                try:
-                    if button.is_visible():
-                        out.append({"id": f"card:{idx}", "title": "",
-                                    "card_index": idx})
-                except Exception:
-                    continue
+            # Fallback, only when NO item links exist: landmark-scoped
+            # menu buttons. Global/header buttons are excluded by the
+            # scoped selector itself, so they can neither create fake
+            # listings nor consume Min-Max slots. Tokens are positions
+            # inside this scoped collection, not page-wide indexes.
+            scoped = scoped_buttons[:200]
+            self.relist_edit_last_discovery.update({
+                "buttons_total": len(scoped),
+                "cap_reached": len(scoped_buttons) > 200,
+            })
+            for idx, _button in enumerate(scoped):
+                out.append({"id": f"card:{idx}", "title": "",
+                            "card_index": idx})
             if out:
-                self.relist_edit_last_discovery["path"] = "visible_card_buttons"
-                return out[:50]
-        except Exception:
-            pass
+                self.relist_edit_last_discovery["path"] = "card_buttons"
+        except Exception as exc:
+            self._last_error = f"Relist & Edit selling-page discovery failed: {exc}"
         return out
 
     def edit_listing(self, listing_id: str, payload: dict) -> bool:
@@ -3650,7 +3708,8 @@ class PlaywrightDriver(BaseDriver):
         browser UI, not page content, and cannot itself be clicked by
         automation). Card-token listings ("card:<index>", 2026-11-03
         card-button discovery) skip the link lookup and click the
-        "..." button at that position directly. Simplified 2026-11-03,
+        "..." button at that position inside the landmark-scoped
+        button collection directly. Simplified 2026-11-03,
         per the user's order: NO
         link-identity verification — the card whose "..." was clicked
         IS the listing being edited, so its menu's "Edit listing" link
@@ -3675,16 +3734,42 @@ class PlaywrightDriver(BaseDriver):
                     "current_price": None, "new_price": None,
                     "reason": reason}
 
-        # 1. Resolve this exact listing link, then its own card container.
-        # For link-backed listings, never pair unrelated page-wide link and
-        # button indexes: locate the nearest ancestor containing the card's
-        # ellipsis button. Scroll only this target link if it is off-screen.
+        # 1. Re-identify the exact listing card immediately before
+        # clicking — never trust a discovery-time index, and never pair
+        # indexes across separate DOM collections (Facebook may re-render
+        # between discovery and the click). Link-backed listings are
+        # re-found by exact id, and their button is resolved from the
+        # link's OWN card container (nearest ancestor holding a menu
+        # button). Card tokens resolve inside the landmark-scoped button
+        # collection only, so a global button can never shift them.
+        # If the intended card cannot be verified, SKIP it — never open
+        # another listing's menu. Scroll only this target into view.
+        _ancestor_with_button = (
+            "xpath=ancestor::*[count(.//*["
+            + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
         card_token = str(listing_id).startswith("card:")
         if card_token:
             try:
                 idx = int(str(listing_id)[5:])
-                buttons = page.locator(S.F_RELIST_EDIT_CARD_MENU_BUTTON[1]).all()
-                target_button = buttons[idx]
+                handles = page.locator(
+                    "xpath=" + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                visible = []
+                for handle in handles:
+                    # Only drop a handle when it explicitly reports
+                    # itself hidden. A handle without an is_visible
+                    # method (e.g. a test double) is treated as
+                    # visible, as in v0.2.196 — dropping it would make
+                    # every card token unclickable for no reason.
+                    vis_fn = getattr(handle, "is_visible", None)
+                    if vis_fn is None:
+                        visible.append(handle)
+                        continue
+                    try:
+                        if vis_fn():
+                            visible.append(handle)
+                    except Exception:
+                        continue
+                target_button = visible[idx]
             except Exception:
                 return _skip("menu_button_not_found")
             try:
@@ -3697,7 +3782,7 @@ class PlaywrightDriver(BaseDriver):
                 handles = links_loc.all()
             except Exception:
                 handles = []
-            target_link = None
+            target_index = None
             for i, handle in enumerate(handles):
                 try:
                     href = handle.get_attribute("href") or ""
@@ -3706,37 +3791,29 @@ class PlaywrightDriver(BaseDriver):
                 found_id = (href.rstrip("/").rsplit("/", 1)[-1]
                             .split("?")[0])
                 if found_id == str(listing_id):
-                    target_link = links_loc.nth(i)
+                    target_index = i
                     break
-            if target_link is None:
+            if target_index is None:
                 return _skip("card_not_found")
             try:
-                in_viewport = target_link.evaluate(
-                    "el => { const r = el.getBoundingClientRect(); "
-                    "return r.bottom > 0 && r.right > 0 && "
-                    "r.top < window.innerHeight && r.left < window.innerWidth; }"
-                )
+                target_link = links_loc.nth(target_index)
+                target_link.scroll_into_view_if_needed(timeout=15000)
             except Exception:
-                in_viewport = False
-            if not in_viewport:
-                try:
-                    target_link.scroll_into_view_if_needed(timeout=15000)
-                except Exception:
-                    return _skip("card_not_visible")
+                # Some Facebook layouts keep the card in the DOM but do
+                # not expose scroll support on the anchor. Continue to
+                # the card's own menu rather than failing discovery.
+                pass
             try:
-                card = target_link.locator(
-                    "xpath=ancestor::*[.//div[@role='button' and "
-                    "contains(normalize-space(.), '...')] or "
-                    ".//button[contains(normalize-space(.), '...')]][1]"
-                )
-                card_buttons = card.locator(
-                    S.F_RELIST_EDIT_CARD_MENU_BUTTON[1])
-                target_button = card_buttons.first
-                target_button.wait_for(state="visible", timeout=10000)
+                card_loc = target_link.locator(_ancestor_with_button)
+                if card_loc.count() == 0:
+                    return _skip("menu_button_not_found")
+                button_loc = S.to_playwright(
+                    card_loc, S.F_RELIST_EDIT_CARD_MENU_BUTTON)
+                button_loc.wait_for(state="visible", timeout=10000)
             except Exception:
                 return _skip("menu_button_not_found")
             try:
-                human.human_click(page, target_button)
+                human.human_click(page, button_loc)
             except Exception:
                 return _skip("menu_button_not_found")
         # 3. The menu's "Edit listing" link. NO identity check: the
