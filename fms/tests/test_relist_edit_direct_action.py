@@ -865,6 +865,17 @@ class _FakeMenuEditLocator:
     def __init__(self, page):
         self._page = page
 
+    def bounding_box(self):
+        # Stable box by default; when the page sets _edit_box_shifts,
+        # the box moves once and then stays put, so the settle loop
+        # must wait for the second, stable position.
+        if not getattr(self._page, "_edit_box_shifts", False):
+            return {"x": 10, "y": 0, "width": 10, "height": 10}
+        n = getattr(self._page, "_edit_box_calls", 0)
+        self._page._edit_box_calls = n + 1
+        x = 10 if n >= 1 else 0
+        return {"x": x, "y": 0, "width": 10, "height": 10}
+
     def wait_for(self, state=None, timeout=None):
         if (not self._page.edit_link_present
                 or self._page.menu_open_index is None):
@@ -1034,6 +1045,24 @@ def test_playwright_menu_second_listing_after_first_tab_closes(monkeypatch):
     assert tab1.closed is True and tab2.closed is True
     assert tab1.gotos == [EDIT_URL + "L1&from_menu=1"]
     assert tab2.gotos == [EDIT_URL + "L2&from_menu=1"]
+
+
+def test_playwright_menu_waits_for_menu_to_settle_before_edit_link(
+        monkeypatch):
+    # 2026-11-05 timing fix: after the "..." click, the menu must be
+    # fully open (Edit link position settled) before its link is read.
+    # The fake menu's Edit link moves once, then stays put; the run
+    # must still open the FIRST card's menu link and write its price.
+    # Card-token path (the passing menu harness path; the link-backed
+    # "L1" path is a known pre-existing fake-harness failure).
+    page = _menu_page()
+    page._edit_box_shifts = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0], "first card's ... button clicked"
 
 
 def test_playwright_menu_card_not_found_skips(monkeypatch):

@@ -3619,6 +3619,20 @@ class PlaywrightDriver(BaseDriver):
             return {"ok": False, "listing_id": listing_id,
                     "current_price": None, "new_price": None,
                     "reason": "form_not_loaded"}
+        # Form fully open, not just the price box visible: give the
+        # Update button (Save as fallback) time to appear before the
+        # price is read or written, so no price goes to a half-loaded
+        # form. Non-fatal — if neither button appears, continue as
+        # before; the Update step below still decides, with the same
+        # reasons it always had.
+        for _sel, _timeout in ((S.F_RELIST_EDIT_UPDATE_BUTTON, 10000),
+                               (S.F_SAVE_EDIT_BUTTON, 5000)):
+            try:
+                S.to_playwright(tab, _sel).wait_for(state="visible",
+                                                    timeout=_timeout)
+                break
+            except Exception:
+                continue
         try:
             raw = (price_loc.input_value() or "").strip()
             current = float(raw.replace(",", "").replace("$", "")
@@ -3825,6 +3839,25 @@ class PlaywrightDriver(BaseDriver):
             edit_loc.wait_for(state="visible", timeout=15000)
         except Exception:
             return _skip("edit_menu_not_found")
+        # Menu fully open, not just its first link visible: wait until
+        # the Edit link's position has settled (two consecutive samples
+        # ~0.4s apart agree), up to 10s. A menu still animating into
+        # place is not clicked yet. If the position can never be sampled
+        # the visible link alone is enough — never fail a working menu
+        # for that, and never wait past the bound: after it, proceed
+        # with the visible link as before.
+        _prev_box = None
+        for _ in range(25):
+            try:
+                _box = edit_loc.bounding_box()
+            except Exception:
+                _box = None
+            if _box is not None and _box == _prev_box:
+                break
+            if _box is None and _prev_box is None:
+                break
+            _prev_box = _box
+            time.sleep(0.4)
         try:
             href = edit_loc.get_attribute("href") or ""
         except Exception:
