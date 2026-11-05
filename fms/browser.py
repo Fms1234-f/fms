@@ -3767,40 +3767,117 @@ class PlaywrightDriver(BaseDriver):
         # button). Card tokens resolve inside the landmark-scoped button
         # collection only, so a global button can never shift them.
         # If the intended card cannot be verified, SKIP it — never open
-        # another listing's menu. Scroll only this target into view.
-        _ancestor_with_button = (
-            "xpath=ancestor::*[count(.//*["
-            + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
-        card_token = str(listing_id).startswith("card:")
-        if card_token:
+        # another listing's menu.
+        #
+        # Menu-click rules (2026-11-05, user order — the live failure
+        # was: 2 listings edited, then the 3rd click missed the "..."
+        # and opened the listing detail dialog instead, because the
+        # list had shifted and the button was below the fold):
+        #   a. Click the button DIRECTLY on the element — never by
+        #      mouse coordinates, which land on the card when the list
+        #      shifts. Playwright's click waits until the element is
+        #      stable, visible and receives events.
+        #   b. Before clicking, scroll until the button is actually
+        #      visible in the viewport and VERIFY it — never guess with
+        #      a blind click. If it cannot be shown, skip.
+        #   c. If the click still misses and the detail dialog opens
+        #      instead of the menu, close it and retry the click once,
+        #      freshly resolved.
+        def _visible_in_viewport(clickable):
+            """True only if the button is visible and inside the viewport.
+
+            A clickable without an is_visible method (a test double) is
+            treated as visible, as in v0.2.196; one without a measurable
+            box is visible-enough once is_visible passes.
+            """
+            vis_fn = getattr(clickable, "is_visible", None)
+            if vis_fn is not None:
+                try:
+                    if not vis_fn():
+                        return False
+                except Exception:
+                    return False
             try:
-                idx = int(str(listing_id)[5:])
-                handles = page.locator(
-                    "xpath=" + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
-                visible = []
-                for handle in handles:
-                    # Only drop a handle when it explicitly reports
-                    # itself hidden. A handle without an is_visible
-                    # method (e.g. a test double) is treated as
-                    # visible, as in v0.2.196 — dropping it would make
-                    # every card token unclickable for no reason.
-                    vis_fn = getattr(handle, "is_visible", None)
-                    if vis_fn is None:
-                        visible.append(handle)
-                        continue
-                    try:
-                        if vis_fn():
+                box = clickable.bounding_box()
+            except Exception:
+                box = None
+            if box is None:
+                return True
+            try:
+                vp = page.viewport_size or {}
+                vw = vp.get("width") or 0
+                vh = vp.get("height") or 0
+            except Exception:
+                vw = vh = 0
+            if not vw or not vh:
+                return True
+            return (box["x"] >= 0 and box["y"] >= 0
+                    and box["x"] + box["width"] <= vw
+                    and box["y"] + box["height"] <= vh)
+
+        def _bring_into_view(clickable):
+            """Scroll until the button is visible in the viewport.
+
+            Bounded: a few scroll nudges, then give up — never guess
+            with a blind click when the button cannot be shown.
+            """
+            for _ in range(5):
+                try:
+                    clickable.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                if _visible_in_viewport(clickable):
+                    return True
+                try:
+                    page.mouse.wheel(0, 600)
+                except Exception:
+                    break
+                time.sleep(0.3)
+            return _visible_in_viewport(clickable)
+
+        def _click_direct(clickable):
+            """Click the element itself (Playwright waits until it is
+            stable, visible and receives events) — no coordinates."""
+            try:
+                clickable.click(timeout=15000)
+                return True
+            except Exception:
+                return False
+
+        def _resolve_button():
+            """Re-find this listing's "..." button fresh.
+
+            Returns (clickable, reason); reason is None on success.
+            """
+            _ancestor_with_button = (
+                "xpath=ancestor::*[count(.//*["
+                + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
+            card_token = str(listing_id).startswith("card:")
+            if card_token:
+                try:
+                    idx = int(str(listing_id)[5:])
+                    handles = page.locator(
+                        "xpath="
+                        + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                    visible = []
+                    for handle in handles:
+                        # Only drop a handle when it explicitly reports
+                        # itself hidden. A handle without an is_visible
+                        # method (e.g. a test double) is treated as
+                        # visible, as in v0.2.196 — dropping it would
+                        # make every card token unclickable for no reason.
+                        vis_fn = getattr(handle, "is_visible", None)
+                        if vis_fn is None:
                             visible.append(handle)
-                    except Exception:
-                        continue
-                target_button = visible[idx]
-            except Exception:
-                return _skip("menu_button_not_found")
-            try:
-                human.human_click(page, target_button)
-            except Exception:
-                return _skip("menu_button_not_found")
-        else:
+                            continue
+                        try:
+                            if vis_fn():
+                                visible.append(handle)
+                        except Exception:
+                            continue
+                    return visible[idx], None
+                except Exception:
+                    return None, "menu_button_not_found"
             try:
                 links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
                 handles = links_loc.all()
@@ -3818,37 +3895,75 @@ class PlaywrightDriver(BaseDriver):
                     target_index = i
                     break
             if target_index is None:
-                return _skip("card_not_found")
+                return None, "card_not_found"
             try:
                 target_link = links_loc.nth(target_index)
-                target_link.scroll_into_view_if_needed(timeout=15000)
-            except Exception:
-                # Some Facebook layouts keep the card in the DOM but do
-                # not expose scroll support on the anchor. Continue to
-                # the card's own menu rather than failing discovery.
-                pass
-            try:
                 card_loc = target_link.locator(_ancestor_with_button)
                 if card_loc.count() == 0:
-                    return _skip("menu_button_not_found")
+                    return None, "menu_button_not_found"
                 button_loc = S.to_playwright(
                     card_loc, S.F_RELIST_EDIT_CARD_MENU_BUTTON)
                 button_loc.wait_for(state="visible", timeout=10000)
+                return button_loc, None
             except Exception:
-                return _skip("menu_button_not_found")
+                return None, "menu_button_not_found"
+
+        def _click_menu_button():
+            """Resolve fresh, scroll into view, verify, click directly.
+
+            Returns (True, None) or (False, reason).
+            """
+            clickable, reason = _resolve_button()
+            if clickable is None:
+                return False, reason
+            if not _bring_into_view(clickable):
+                return False, "menu_button_not_visible"
+            if not _click_direct(clickable):
+                return False, "menu_button_not_found"
+            return True, None
+
+        def _wait_for_edit_link():
+            edit_loc = S.to_playwright(
+                page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
             try:
-                human.human_click(page, button_loc)
+                edit_loc.wait_for(state="visible", timeout=15000)
+                return edit_loc
             except Exception:
-                return _skip("menu_button_not_found")
-        # 3. The menu's "Edit listing" link. NO identity check: the
+                return None
+
+        def _detail_dialog_open():
+            try:
+                dlg = S.to_playwright(
+                    page, S.F_RELIST_EDIT_DETAIL_DIALOG)
+                return bool(dlg.is_visible())
+            except Exception:
+                return False
+
+        ok, reason = _click_menu_button()
+        if not ok:
+            return _skip(reason)
+        # 2. The menu's "Edit listing" link. NO identity check: the
         # card whose "..." was clicked is the listing being edited, so
         # this link is opened whatever its destination says (user's
         # 2026-11-03 simplified rule — a mismatch is not a skip).
-        edit_loc = S.to_playwright(page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
-        try:
-            edit_loc.wait_for(state="visible", timeout=15000)
-        except Exception:
-            return _skip("edit_menu_not_found")
+        edit_loc = _wait_for_edit_link()
+        if edit_loc is None:
+            # The click may have missed the "..." and opened the
+            # listing detail dialog instead (the 2026-11-05 live
+            # failure: 2 listings edited, then "Your listing" opened).
+            # Close it and try the "..." click once more, freshly
+            # resolved. If the menu still does not open, skip.
+            if _detail_dialog_open():
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                time.sleep(1)
+                ok, _reason = _click_menu_button()
+                if ok:
+                    edit_loc = _wait_for_edit_link()
+            if edit_loc is None:
+                return _skip("edit_menu_not_found")
         # Menu fully open, not just its first link visible: wait until
         # the Edit link's position has settled (two consecutive samples
         # ~0.4s apart agree), up to 10s. A menu still animating into

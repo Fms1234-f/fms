@@ -39,6 +39,12 @@ Covers the user-confirmed 2026-11-02 design, nothing else:
      menu's "Edit listing" LINK is opened in a new tab. A menu-step
      failure skips that listing (no price written, no silent direct-URL
      fallback) and the next listing is still processed.
+     2026-11-05 click fix: the "..." button is clicked DIRECTLY on the
+     element (never by mouse coordinates, which land on the card when
+     the list shifts), scrolled into view and verified visible first
+     (a button that cannot be shown is skipped, never blind-clicked),
+     and a missed click that opens the listing detail dialog is closed
+     (Escape) and retried once, freshly resolved.
   10. Card-button discovery (2026-11-03, Relist & Edit ONLY): after
      the v0.2.193 live test still found nothing, listings are
      discovered by their card "..." buttons in page order (item links
@@ -872,13 +878,66 @@ class _FakeMenuButton:
     def scroll_into_view_if_needed(self, timeout=None):
         pass
 
+    def is_visible(self):
+        return getattr(self._page, "button_visible", True)
+
     def bounding_box(self):
-        return None
+        # None by default (old behaviour); a test may set
+        # page.button_box to a real box to prove the click does not
+        # depend on mouse coordinates.
+        return getattr(self._page, "button_box", None)
 
     def click(self, delay=None, timeout=None):
+        first_click = len(self._page.menu_clicks) == 0
         self._page.menu_clicks.append(self._index)
+        if (getattr(self._page, "detail_opens_first_click", False)
+                and first_click):
+            # Missed "..." click: the listing detail dialog opens
+            # instead of the menu (the 2026-11-05 live failure).
+            self._page.detail_open = True
+            return
         if self._page.menu_opens:
             self._page.menu_open_index = self._index
+
+
+class _FakeMouse:
+    def __init__(self):
+        self.clicks = []
+        self.wheels = []
+
+    def click(self, x, y):
+        self.clicks.append((x, y))
+
+    def wheel(self, dx, dy):
+        self.wheels.append((dx, dy))
+
+
+class _FakeKeyboard:
+    def __init__(self, page):
+        self._page = page
+        self.presses = []
+
+    def press(self, key):
+        self.presses.append(key)
+        if key == "Escape":
+            self._page.detail_open = False
+
+
+class _FakeDetailDialog:
+    def __init__(self, page):
+        self._page = page
+
+    def is_visible(self):
+        return bool(getattr(self._page, "detail_open", False))
+
+
+class _FakeDetailDialogCollection:
+    def __init__(self, page):
+        self._page = page
+
+    @property
+    def first(self):
+        return _FakeDetailDialog(self._page)
 
 
 class _FakeMenuButtons:
@@ -947,6 +1006,13 @@ class _FakeMenuPage:
         self.edit_href_none = edit_href_none
         self.menu_clicks = []
         self.menu_open_index = None
+        self.mouse = _FakeMouse()
+        self.keyboard = _FakeKeyboard(self)
+        self.detail_open = False
+        self.detail_opens_first_click = False
+        self.button_box = None
+        self.button_visible = True
+        self.viewport_size = {"width": 800, "height": 600}
 
     def locator(self, sel):
         if "/marketplace/item/" in sel:
@@ -955,6 +1021,8 @@ class _FakeMenuPage:
             return _FakeMenuButtons(self)
         if "Edit listing" in sel:
             return _FakeMenuEditCollection(self)
+        if "Your listing" in sel:
+            return _FakeDetailDialogCollection(self)
         raise AssertionError(f"unexpected selector {sel!r}")
 
 
@@ -1118,6 +1186,58 @@ def test_playwright_menu_card_token_clicks_button_at_that_position(
     assert tab.gotos == [EDIT_URL + "L2&from_menu=1"], tab.gotos
     assert page.menu_clicks == [1], "second card's ... button clicked"
     assert tab.closed is True
+
+
+def test_playwright_menu_clicks_button_directly_not_by_mouse_coords(
+        monkeypatch):
+    # 2026-11-05 live failure: the "..." click used mouse coordinates
+    # (human_click) and landed on the card when the list shifted, opening
+    # the listing detail dialog. The menu step must click the button
+    # element directly — so even with a measurable bounding box, no
+    # mouse-coordinate click is ever used. Card-token path (the passing
+    # menu harness path).
+    page = _menu_page()
+    page.button_box = {"x": 10, "y": 10, "width": 20, "height": 20}
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0], "button element clicked directly"
+    assert page.mouse.clicks == [], "no mouse-coordinate click used"
+
+
+def test_playwright_menu_detail_dialog_closed_and_click_retried(monkeypatch):
+    # 2026-11-05 live failure, end to end: the first "..." click opens
+    # the listing detail dialog ("Your listing") instead of the menu.
+    # The menu step must close it (Escape) and retry the "..." click
+    # once, freshly resolved — then the menu opens and the price is
+    # written. Card-token path (the passing menu harness path).
+    page = _menu_page()
+    page.detail_opens_first_click = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0, 0], "first click missed, retry clicked"
+    assert page.keyboard.presses == ["Escape"], "detail dialog closed once"
+    assert page.detail_open is False
+
+
+def test_playwright_menu_button_below_fold_skips_without_blind_click(
+        monkeypatch):
+    # User order 2026-11-05: if the "..." button cannot be shown in the
+    # viewport (here: its box sits below the fold), never guess with a
+    # blind click — skip the listing with a reason instead.
+    page = _menu_page()
+    page.button_box = {"x": 10, "y": 900, "width": 20, "height": 20}
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "menu_button_not_visible"
+    assert page.menu_clicks == [], "no click attempted while not visible"
+    assert drv._context.new_pages == 0, "no edit tab opened"
 
 
 class _MenuFakeDriver(FakeDriver):

@@ -210,6 +210,12 @@ F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED = (
     " or ancestor::*[@role='toolbar'])]")
 F_RELIST_EDIT_MENU_EDIT_LINK = ("css", "a:has-text('Edit listing'), "
                                      "[role='menuitem']:has-text('Edit listing')")
+# The listing detail dialog ("Your listing") that opens when a card —
+# not its "..." button — is clicked by mistake. Detected only so the
+# menu step can close it and retry the "..." click once (2026-11-05).
+# Exact text match: the sidebar says "Your listings" (plural).
+F_RELIST_EDIT_DETAIL_DIALOG = ("xpath",
+                               "//*[normalize-space()='Your listing']")
 
 # ------------------------------------------------- scrap (read-only) ---
 # Best-effort selectors for extracting a listing's public data.
