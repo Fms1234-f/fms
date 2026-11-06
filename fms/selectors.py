@@ -132,15 +132,18 @@ F_CONFIRM_DELETE_BUTTON = ("css", "div[aria-label='Delete'][role='button'], "
 # Delete Previous ONLY: the selling-page "Delete listing" confirmation
 # dialog's Delete button. The old F_CONFIRM_DELETE_BUTTON matches the
 # listing-page delete button (div[aria-label='Delete']); the selling-page
-# dialog shows a blue <button> with the text "Delete" instead, which
-# that selector misses — the 2026-11-06 live run opened the dialog and
-# then skipped every listing (delete_confirm_not_found, then the open
-# dialog blocked every "..." click). All three forms are tried so the
-# dialog is confirmed whichever form Facebook renders. Do NOT change
-# F_CONFIRM_DELETE_BUTTON — the other delete flows use it.
+# dialog's Delete is a div[role='button'] with the text "Delete" and no
+# aria-label — v0.2.205 only matched a native <button> inside the dialog
+# and the 2026-11-06 live run skipped all 5 listings
+# (delete_confirm_not_found) even though the dialog opened every time.
+# All forms are tried so the dialog is confirmed whichever form
+# Facebook renders. Do NOT change F_CONFIRM_DELETE_BUTTON — the other
+# delete flows use it.
 F_DELETE_PREVIOUS_CONFIRM_BUTTON = (
     "css", "div[aria-label='Delete'][role='button'], "
-    "button[type='submit'], [role='dialog'] button:has-text('Delete')")
+    "button[type='submit'], [role='dialog'] button:has-text('Delete'), "
+    "[role='dialog'] [role='button']:has-text('Delete'), "
+    "[role='alertdialog'] [role='button']:has-text('Delete')")
 F_RENEW_BUTTON = ("css", "div[aria-label*='Renew' i][role='button'], "
                          "span:has-text('Renew listing')")
 

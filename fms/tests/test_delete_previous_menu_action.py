@@ -427,6 +427,31 @@ class _FakeConfirmCollection:
         return _FakeConfirmButton(self._page)
 
 
+class _FakeConfirmMissingButton:
+    """Confirm button the selector does NOT match: the dialog may be
+    open, but this button is invisible to the lookup — models the
+    2026-11-06 live run, where the dialog's Delete was a
+    div[role=button] with no aria-label and the old selector missed it."""
+
+    def wait_for(self, state=None, timeout=None):
+        raise RuntimeError("confirm dialog not visible")
+
+    def is_visible(self):
+        return False
+
+    def click(self, delay=None, timeout=None):
+        raise RuntimeError("confirm dialog not visible")
+
+
+class _FakeConfirmMissingCollection:
+    def __init__(self, page):
+        self._page = page
+
+    @property
+    def first(self):
+        return _FakeConfirmMissingButton()
+
+
 class _FakeDetailDialog:
     def __init__(self, page):
         self._page = page
@@ -449,7 +474,7 @@ class _FakeDeletePage:
 
     def __init__(self, card_ids, card_hrefs=None, buttons_missing=False,
                  menu_opens=True, delete_link_present=True,
-                 confirm_opens=True):
+                 confirm_opens=True, confirm_form="aria_label_div"):
         self.cards = list(card_ids)
         self.card_hrefs = list(card_hrefs or
                                [f"https://www.facebook.com/marketplace/item/{i}/"
@@ -458,6 +483,13 @@ class _FakeDeletePage:
         self.menu_opens = menu_opens
         self.delete_link_present = delete_link_present
         self.confirm_opens = confirm_opens
+        # Shape of the dialog's Delete button. "aria_label_div" is the
+        # old shape (div[aria-label='Delete'][role='button']).
+        # "div_role_button" is the live shape (2026-11-06): a
+        # div[role=button] with the text "Delete" and no aria-label,
+        # inside [role='dialog'] — only matched when the selector
+        # carries the dialog div[role=button] alternative.
+        self.confirm_form = confirm_form
         self.menu_clicks = []
         self.delete_clicks = []
         self.confirm_clicks = []
@@ -481,6 +513,13 @@ class _FakeDeletePage:
         if "Delete listing" in sel:
             return _FakeDeleteLinkCollection(self)
         if "aria-label='Delete'" in sel:
+            if getattr(self, "confirm_form", "aria_label_div") == "div_role_button":
+                # Live dialog shape: only the dialog div[role=button]
+                # alternative matches this button. Without it the
+                # confirm wait times out (delete_confirm_not_found).
+                if "[role='dialog'] [role='button']:has-text('Delete')" in sel:
+                    return _FakeConfirmCollection(self)
+                return _FakeConfirmMissingCollection(self)
             return _FakeConfirmCollection(self)
         if "Your listing" in sel:
             return _FakeDetailDialogCollection(self)
@@ -582,6 +621,19 @@ def test_delete_previous_confirm_missing_skips(monkeypatch):
     assert page.keyboard.presses == ["Escape"], "open dialog closed on skip"
 
 
+def test_delete_previous_confirm_div_role_button_in_dialog_deletes(monkeypatch):
+    # Live shape (2026-11-06 run, 0/5): the dialog's Delete is a
+    # div[role=button] with text "Delete" and no aria-label, inside
+    # [role='dialog'] — the v0.2.205 selector missed it on every listing.
+    page = _FakeDeletePage(["card:0", "card:1"],
+                           confirm_form="div_role_button")
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res == {"ok": True, "listing_id": "card:0", "reason": None}
+    assert page.deleted == ["card:0"]
+    assert page.confirm_clicks == [True], "dialog div Delete clicked"
+
+
 def test_delete_previous_click_throws_but_menu_opened_deletes(monkeypatch):
     page = _delete_page()
     page.fail_clicks_first = 1
@@ -628,6 +680,8 @@ def test_confirm_selector_covers_dialog_button_form():
     from fms import selectors as S
     sel = S.F_DELETE_PREVIOUS_CONFIRM_BUTTON[1]
     assert "[role='dialog'] button:has-text('Delete')" in sel
+    assert "[role='dialog'] [role='button']:has-text('Delete')" in sel
+    assert "[role='alertdialog'] [role='button']:has-text('Delete')" in sel
     assert "div[aria-label='Delete'][role='button']" in sel
     src = (ROOT / "browser.py").read_text(encoding="utf-8")
     assert "F_DELETE_PREVIOUS_CONFIRM_BUTTON" in src
