@@ -3837,12 +3837,63 @@ class PlaywrightDriver(BaseDriver):
 
         def _click_direct(clickable):
             """Click the element itself (Playwright waits until it is
-            stable, visible and receives events) — no coordinates."""
+            stable, visible and receives events) — no coordinates.
+
+            Short timeout per attempt: the caller retries with a fresh
+            resolve, so one stuck click must not burn the whole budget
+            (2026-11-06 live run: a single 15s click timed out on a
+            "..." button caught mid re-render and skipped a listing
+            that worked a moment later)."""
             try:
-                clickable.click(timeout=15000)
+                clickable.click(timeout=5000)
                 return True
             except Exception:
                 return False
+
+        def _wait_for_list_settled():
+            """Wait until the selling list stops re-rendering.
+
+            After an edit tab closes, Facebook rebuilds the list:
+            cards mount/unmount and "..." buttons shift. A button
+            resolved mid-shift can never be clicked. Sample the
+            landmark-scoped "..." button collection — visible count
+            plus the first visible button's (rounded) box — twice
+            ~0.5s apart; equal samples mean the list has settled.
+            Bounded (~5s) and never fatal: an unsettled list still
+            proceeds to the resolve below, and the retry loop in
+            _click_menu_button covers the rest."""
+            prev = None
+            for _ in range(10):
+                try:
+                    handles = page.locator(
+                        "xpath="
+                        + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                    count = 0
+                    box = None
+                    for handle in handles:
+                        try:
+                            if not handle.is_visible():
+                                continue
+                        except Exception:
+                            continue
+                        count += 1
+                        if box is None:
+                            try:
+                                raw = handle.bounding_box() or {}
+                                box = (round(raw.get("x", 0)),
+                                       round(raw.get("y", 0)),
+                                       round(raw.get("width", 0)),
+                                       round(raw.get("height", 0)))
+                            except Exception:
+                                box = None
+                    sig = (count, box)
+                except Exception:
+                    sig = None
+                if prev is not None and sig == prev:
+                    return True
+                prev = sig
+                time.sleep(0.5)
+            return False
 
         def _resolve_button():
             """Re-find this listing's "..." button fresh.
@@ -3911,16 +3962,29 @@ class PlaywrightDriver(BaseDriver):
         def _click_menu_button():
             """Resolve fresh, scroll into view, verify, click directly.
 
-            Returns (True, None) or (False, reason).
-            """
-            clickable, reason = _resolve_button()
-            if clickable is None:
-                return False, reason
-            if not _bring_into_view(clickable):
-                return False, "menu_button_not_visible"
-            if not _click_direct(clickable):
-                return False, "menu_button_not_found"
-            return True, None
+            Retries with a fresh resolve, up to 3 attempts: after an
+            edit, Facebook re-renders the selling list, and a "..."
+            button caught mid-shift never becomes clickable — one long
+            wait on it burns the budget and skips a listing that works
+            a moment later (2026-11-06 live run: card:2 skipped
+            menu_button_not_found exactly 15s after card:1, the old
+            single 15s click timeout). Each attempt first waits for
+            the list to settle, then resolves fresh. Returns
+            (True, None) or (False, reason)."""
+            last_reason = "menu_button_not_found"
+            for _attempt in range(3):
+                _wait_for_list_settled()
+                clickable, reason = _resolve_button()
+                if clickable is None:
+                    last_reason = reason
+                    continue
+                if not _bring_into_view(clickable):
+                    last_reason = "menu_button_not_visible"
+                    continue
+                if _click_direct(clickable):
+                    return True, None
+                last_reason = "menu_button_not_found"
+            return False, last_reason
 
         def _wait_for_edit_link():
             edit_loc = S.to_playwright(

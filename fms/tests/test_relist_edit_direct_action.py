@@ -890,6 +890,13 @@ class _FakeMenuButton:
     def click(self, delay=None, timeout=None):
         first_click = len(self._page.menu_clicks) == 0
         self._page.menu_clicks.append(self._index)
+        if getattr(self._page, "fail_clicks_first", 0) > 0:
+            # 2026-11-06 live failure: the "..." click itself times out
+            # (button caught mid re-render) — the attempt is recorded,
+            # then it raises so the caller can retry with a fresh
+            # resolve instead of burning one long wait.
+            self._page.fail_clicks_first -= 1
+            raise RuntimeError("click timeout")
         if (getattr(self._page, "detail_opens_first_click", False)
                 and first_click):
             # Missed "..." click: the listing detail dialog opens
@@ -947,8 +954,17 @@ class _FakeMenuButtons:
     def all(self):
         if self._page.buttons_missing:
             return []
+        n = len(self._page.cards)
+        if getattr(self._page, "settle_shifts", False):
+            # The list is mid re-render: the first scan sees one fewer
+            # button, later scans see the full set — the settle wait
+            # must notice the change and keep waiting.
+            c = getattr(self._page, "_all_calls", 0)
+            self._page._all_calls = c + 1
+            if c == 0:
+                n = max(0, n - 1)
         return [_FakeMenuButton(self._page, i)
-                for i in range(len(self._page.cards))]
+                for i in range(n)]
 
 
 class _FakeMenuEditLocator:
@@ -1237,6 +1253,55 @@ def test_playwright_menu_button_below_fold_skips_without_blind_click(
     res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
     assert res["ok"] is False and res["reason"] == "menu_button_not_visible"
     assert page.menu_clicks == [], "no click attempted while not visible"
+    assert drv._context.new_pages == 0, "no edit tab opened"
+
+
+def test_playwright_menu_click_timeout_retried_with_fresh_resolve(
+        monkeypatch):
+    # 2026-11-06 live failure, end to end: card:2 skipped
+    # menu_button_not_found exactly 15s after card:1 — the "..." click
+    # timed out on a button caught mid re-render, and the old code
+    # spent its whole budget on that one click. The menu step must
+    # retry with a freshly resolved button (short click per attempt)
+    # instead of giving up. Card-token path.
+    page = _menu_page()
+    page.fail_clicks_first = 1
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0, 0], "first click timed out, retry clicked"
+    assert tab.closed is True
+
+
+def test_playwright_menu_settle_waits_for_shifting_list(monkeypatch):
+    # After an edit the selling list re-renders: the first scan sees
+    # one fewer "..." button than the settled list. The menu step must
+    # wait until the button collection stops changing before it
+    # resolves — not click into a half-built list. Card-token path.
+    page = _menu_page()
+    page.settle_shifts = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0], "settled list, first card clicked"
+    assert page._all_calls >= 4, "settle sampled before resolving"
+
+
+def test_playwright_menu_button_genuinely_missing_skips_after_retries(
+        monkeypatch):
+    # A button that is genuinely absent must still end in a skip, not
+    # an endless retry loop and never a blind click. Card-token path.
+    page = _menu_page()
+    page.buttons_missing = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is False and res["reason"] == "menu_button_not_found"
+    assert page.menu_clicks == [], "no click attempted while missing"
     assert drv._context.new_pages == 0, "no edit tab opened"
 
 
