@@ -4144,6 +4144,406 @@ class PlaywrightDriver(BaseDriver):
             except Exception:
                 pass
 
+    def delete_previous_listing_via_menu(self, listing_id: str) -> dict:
+        """Delete Previous (one listing) via the selling-page card menu —
+        Delete Previous ONLY, no other action uses this method.
+
+        The menu step is the same as Relist & Edit's (same selling
+        page, same "..." button resolve, same settle / bring-into-view /
+        direct-click / menu-open rules, same turn-start cleanup of a
+        stale menu, same retry when the menu closed by itself), so
+        everything Relist & Edit's live runs proved about opening the
+        menu holds here too. The one difference is what the menu entry
+        does: Relist & Edit opens the menu's "Edit listing" LINK in a
+        new tab; Delete Previous clicks the menu's "Delete listing"
+        entry IN PLACE (no new tab — the deletion happens on the
+        selling page itself) and then clicks the Delete button on the
+        confirmation dialog Facebook shows. The dialog closing — not
+        the click's return — is the proof the delete went through: a
+        click can throw after Facebook already removed the listing
+        and re-rendered. If the card, the "..." button, the menu, the
+        "Delete listing" entry, or the confirm dialog genuinely
+        cannot be found, the listing is SKIPPED with a logged reason,
+        NOTHING is deleted, and the run continues with the next
+        listing. A menu-step skip NEVER falls back to the direct
+        delete URL — that would hide the very step the user asked
+        for."""
+        self._ensure()
+        assert self._context is not None
+        page = self._page
+        assert page is not None
+
+        def _skip(reason):
+            self._last_error = (f"Delete Previous: menu step failed for "
+                                f"listing {listing_id} ({reason})")
+            return {"ok": False, "listing_id": listing_id,
+                    "reason": reason}
+
+        def _visible_in_viewport(clickable):
+            """True only if the button is visible and inside the viewport.
+
+            A clickable without an is_visible method (a test double) is
+            treated as visible, as in v0.2.196; one without a measurable
+            box is visible-enough once is_visible passes.
+            """
+            vis_fn = getattr(clickable, "is_visible", None)
+            if vis_fn is not None:
+                try:
+                    if not vis_fn():
+                        return False
+                except Exception:
+                    return False
+            try:
+                box = clickable.bounding_box()
+            except Exception:
+                box = None
+            if box is None:
+                return True
+            try:
+                vp = page.viewport_size or {}
+                vw = vp.get("width") or 0
+                vh = vp.get("height") or 0
+            except Exception:
+                vw = vh = 0
+            if not vw or not vh:
+                return True
+            return (box["x"] >= 0 and box["y"] >= 0
+                    and box["x"] + box["width"] <= vw
+                    and box["y"] + box["height"] <= vh)
+
+        def _bring_into_view(clickable):
+            """Scroll until the button is visible in the viewport.
+
+            Bounded: a few scroll nudges, then give up — never guess
+            with a blind click when the button cannot be shown.
+            """
+            for _ in range(5):
+                try:
+                    clickable.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                if _visible_in_viewport(clickable):
+                    return True
+                try:
+                    page.mouse.wheel(0, 600)
+                except Exception:
+                    break
+                time.sleep(0.3)
+            return _visible_in_viewport(clickable)
+
+        def _click_direct(clickable):
+            """Click the element itself (Playwright waits until it is
+            stable, visible and receives events) — no coordinates.
+
+            Short timeout per attempt: the caller retries with a fresh
+            resolve, so one stuck click must not burn the whole budget.
+            """
+            try:
+                clickable.click(timeout=5000)
+                return True
+            except Exception:
+                return False
+
+        def _wait_for_list_settled():
+            """Wait until the selling list stops re-rendering.
+
+            After a delete, Facebook rebuilds the list: cards
+            mount/unmount and "..." buttons shift. A button resolved
+            mid-shift can never be clicked. Sample the landmark-scoped
+            "..." button collection — visible count plus the first
+            visible button's (rounded) box — twice ~0.5s apart; equal
+            samples mean the list has settled. Bounded (~5s) and
+            never fatal: an unsettled list still proceeds to the
+            resolve below, and the retry loop in _click_menu_button
+            covers the rest."""
+            prev = None
+            for _ in range(10):
+                try:
+                    handles = page.locator(
+                        "xpath="
+                        + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                    count = 0
+                    box = None
+                    for handle in handles:
+                        try:
+                            if not handle.is_visible():
+                                continue
+                        except Exception:
+                            continue
+                        count += 1
+                        if box is None:
+                            try:
+                                raw = handle.bounding_box() or {}
+                                box = (round(raw.get("x", 0)),
+                                       round(raw.get("y", 0)),
+                                       round(raw.get("width", 0)),
+                                       round(raw.get("height", 0)))
+                            except Exception:
+                                box = None
+                    sig = (count, box)
+                except Exception:
+                    sig = None
+                if prev is not None and sig == prev:
+                    return True
+                prev = sig
+                time.sleep(0.5)
+            return False
+
+        def _resolve_button():
+            """Re-find this listing's "..." button fresh.
+
+            Returns (clickable, reason); reason is None on success.
+            """
+            _ancestor_with_button = (
+                "xpath=ancestor::*[count(.//*["
+                + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
+            card_token = str(listing_id).startswith("card:")
+            if card_token:
+                try:
+                    idx = int(str(listing_id)[5:])
+                    handles = page.locator(
+                        "xpath="
+                        + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                    visible = []
+                    for handle in handles:
+                        vis_fn = getattr(handle, "is_visible", None)
+                        if vis_fn is None:
+                            visible.append(handle)
+                            continue
+                        try:
+                            if vis_fn():
+                                visible.append(handle)
+                        except Exception:
+                            continue
+                    return visible[idx], None
+                except Exception:
+                    return None, "menu_button_not_found"
+            try:
+                links_loc = page.locator(S.SCR_MY_LISTING_LINKS[1])
+                handles = links_loc.all()
+            except Exception:
+                handles = []
+            target_index = None
+            for i, handle in enumerate(handles):
+                try:
+                    href = handle.get_attribute("href") or ""
+                except Exception:
+                    continue
+                found_id = (href.rstrip("/").rsplit("/", 1)[-1]
+                            .split("?")[0])
+                if found_id == str(listing_id):
+                    target_index = i
+                    break
+            if target_index is None:
+                return None, "card_not_found"
+            try:
+                target_link = links_loc.nth(target_index)
+                card_loc = target_link.locator(_ancestor_with_button)
+                if card_loc.count() == 0:
+                    return None, "menu_button_not_found"
+                button_loc = S.to_playwright(
+                    card_loc, S.F_RELIST_EDIT_CARD_MENU_BUTTON)
+                button_loc.wait_for(state="visible", timeout=10000)
+                return button_loc, None
+            except Exception:
+                return None, "menu_button_not_found"
+
+        def _wait_for_delete_link():
+            delete_loc = S.to_playwright(
+                page, S.F_DELETE_PREVIOUS_MENU_DELETE_LINK)
+            try:
+                delete_loc.wait_for(state="visible", timeout=15000)
+                return delete_loc
+            except Exception:
+                return None
+
+        def _wait_for_confirm_button():
+            confirm_loc = S.to_playwright(
+                page, S.F_CONFIRM_DELETE_BUTTON)
+            try:
+                confirm_loc.wait_for(state="visible", timeout=5000)
+                return confirm_loc
+            except Exception:
+                return None
+
+        def _detail_dialog_open():
+            try:
+                dlg = S.to_playwright(
+                    page, S.F_RELIST_EDIT_DETAIL_DIALOG)
+                return bool(dlg.is_visible())
+            except Exception:
+                return False
+
+        def _menu_open(timeout_s=0.0):
+            """True if the listing's action menu is open right now.
+
+            The menu is open when its "Delete listing" entry is
+            visible — the same entry _wait_for_delete_link looks for.
+            The listing detail dialog is not the menu: if "Your
+            listing" is open, the menu is not treated as open.
+            timeout_s: when > 0, keep checking for that long
+            instead of one instant look — the menu renders a
+            moment after the mousedown, so a single instant check
+            can miss a menu that is about to appear."""
+            try:
+                if _detail_dialog_open():
+                    return False
+            except Exception:
+                pass
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            while True:
+                try:
+                    delete_loc = S.to_playwright(
+                        page, S.F_DELETE_PREVIOUS_MENU_DELETE_LINK)
+                    if delete_loc.is_visible():
+                        return True
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.25)
+
+        def _click_menu_button():
+            """Resolve fresh, scroll into view, verify, click directly.
+
+            Retries with a fresh resolve, up to 3 attempts: after a
+            delete, Facebook re-renders the selling list, and a "..."
+            button caught mid-shift never becomes clickable — one long
+            wait on it burns the budget and skips a listing that works
+            a moment later. Each attempt first waits for the list to
+            settle, then resolves fresh.
+
+            A click is NOT the proof the menu opened: the mousedown
+            opens the menu and Facebook's re-render can detach the
+            button before the click finishes, so the click throws
+            even though the menu toggled. After a click, and before
+            any re-click, check whether the menu actually opened —
+            if it did, the click succeeded. Never click "..." while
+            the menu this turn opened is still open: that click
+            would only toggle it shut again. Only a menu this turn
+            itself opened counts (the `clicked` flag), so a stale
+            menu from the previous listing can never pass the check
+            untouched. Returns (True, None) or (False, reason)."""
+            last_reason = "menu_button_not_found"
+            clicked = False
+            for _attempt in range(3):
+                _wait_for_list_settled()
+                if clicked and _menu_open():
+                    return True, None
+                clickable, reason = _resolve_button()
+                if clickable is None:
+                    last_reason = reason
+                    continue
+                if not _bring_into_view(clickable):
+                    last_reason = "menu_button_not_visible"
+                    continue
+                clicked = True
+                if _click_direct(clickable):
+                    return True, None
+                if _menu_open(timeout_s=1.0):
+                    return True, None
+                last_reason = "menu_button_not_found"
+            return False, last_reason
+
+        # A menu (or the detail dialog) left open by the previous
+        # listing must never survive into this listing's turn: it
+        # would scroll with the page, and its Delete link would be
+        # the previous listing's — deleting it twice. Close it
+        # before resolving this listing's "..." button. Runs once
+        # per listing, not per retry: the retries below must not
+        # close a menu that just opened.
+        if _menu_open() or _detail_dialog_open():
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        ok, reason = _click_menu_button()
+        if not ok:
+            return _skip(reason)
+        # 2. The menu's "Delete listing" entry. NO identity check:
+        # the card whose "..." was clicked is the listing being
+        # deleted, so this entry is used whatever its destination
+        # says — the same simplified rule as Relist & Edit.
+        delete_loc = _wait_for_delete_link()
+        if delete_loc is None:
+            # The menu never opened, or it opened and closed by
+            # itself while Facebook re-rendered the list. The click
+            # may also have missed the "..." and opened the listing
+            # detail dialog instead — close that first. Either way,
+            # retry the "..." click once more before skipping: a
+            # listing is skipped only when its menu genuinely
+            # cannot be opened (user rule 2026-11-06: menu open
+            # means the menu entry must be clicked). Never re-click
+            # while the menu is already open — that would only
+            # toggle it shut.
+            if _detail_dialog_open():
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                time.sleep(1)
+            if not _menu_open():
+                ok, _reason = _click_menu_button()
+                if ok:
+                    delete_loc = _wait_for_delete_link()
+            if delete_loc is None:
+                return _skip("delete_menu_not_found")
+        # Menu fully open, not just its first link visible: wait until
+        # the Delete entry's position has settled (two consecutive
+        # samples ~0.4s apart agree), up to 10s. A menu still
+        # animating into place is not clicked yet. If the position can
+        # never be sampled the visible entry alone is enough — never
+        # fail a working menu for that, and never wait past the bound:
+        # after it, proceed with the visible entry as before.
+        _prev_box = None
+        for _ in range(25):
+            try:
+                _box = delete_loc.bounding_box()
+            except Exception:
+                _box = None
+            if _box is not None and _box == _prev_box:
+                break
+            if _box is None and _prev_box is None:
+                break
+            _prev_box = _box
+            time.sleep(0.4)
+        # 3. Click the menu's "Delete listing" entry IN PLACE — no
+        # new tab — and confirm the delete dialog Facebook shows.
+        # The click itself is not the proof: if it throws after the
+        # dialog already opened, the confirm wait below still finds
+        # it; if no dialog appears at all, the listing is skipped.
+        try:
+            delete_loc.click(timeout=5000)
+        except Exception:
+            pass
+        confirm_loc = _wait_for_confirm_button()
+        if confirm_loc is None:
+            return _skip("delete_confirm_not_found")
+        try:
+            confirm_loc.click(timeout=5000)
+        except Exception:
+            pass
+        # The confirm dialog closing — not the click's return — is
+        # the proof the delete went through: the click can throw
+        # after Facebook already removed the listing and re-rendered.
+        # Wait up to ~5s for the dialog (and the menu) to be gone.
+        for _ in range(20):
+            try:
+                confirm_visible = confirm_loc.is_visible()
+            except Exception:
+                confirm_visible = False
+            try:
+                menu_still_open = _menu_open()
+            except Exception:
+                menu_still_open = False
+            if not confirm_visible and not menu_still_open:
+                return {"ok": True, "listing_id": listing_id,
+                        "reason": None}
+            time.sleep(0.25)
+        return _skip("delete_confirm_not_found")
+
     # -- Phase 2: scrap (read-only) -------------------------------------------------
     def open_marketplace(self) -> None:
         """Navigate the main page to Marketplace (Download Images & Titles:
@@ -5644,6 +6044,7 @@ class MockDriver(BaseDriver):
     fake_relist_edit_prices: dict[str, float] = {}  # listing_id -> current price
     fake_relist_edit_not_loaded: set[str] = set()  # forms that never load
     fake_relist_edit_menu_missing: set[str] = set()  # menu step fails
+    fake_delete_previous_menu_missing: set[str] = set()  # menu step fails
 
     def __init__(self, account: dict):
         super().__init__(account)
@@ -5665,6 +6066,7 @@ class MockDriver(BaseDriver):
             cls.fake_relist_edit_prices = {}
             cls.fake_relist_edit_not_loaded = set()
             cls.fake_relist_edit_menu_missing = set()
+            cls.fake_delete_previous_menu_missing = set()
             cls._draft_seq = 0
             cls._tab_seq = 0
 
@@ -5927,6 +6329,21 @@ class MockDriver(BaseDriver):
                     call["via_menu"] = True
                     break
         return res
+
+    def delete_previous_listing_via_menu(self, listing_id: str) -> dict:
+        """Mock Delete Previous menu path: records the menu delete so
+        tests can prove the engine used the menu path (never the old
+        direct delete_listing). Listings in
+        fake_delete_previous_menu_missing simulate a failed menu step —
+        skipped with reason menu_button_not_found, nothing deleted."""
+        if listing_id in getattr(type(self),
+                                 "fake_delete_previous_menu_missing", set()):
+            self._record("delete_previous_skipped", listing_id=listing_id,
+                         reason="menu_button_not_found", via_menu=True)
+            return {"ok": False, "listing_id": listing_id,
+                    "reason": "menu_button_not_found"}
+        self._record("delete_previous", listing_id=listing_id, via_menu=True)
+        return {"ok": True, "listing_id": listing_id, "reason": None}
 
     def scrape_listing(self, url: str) -> dict | None:
         data = type(self).fake_scrapes.get(url)

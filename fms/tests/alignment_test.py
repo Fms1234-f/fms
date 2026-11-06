@@ -154,11 +154,18 @@ def t_delete_previous():
                          "AND status = 'posted'", (rid1,))
     assert len(posted) == 1
     fb_id = posted[0]["fb_listing_id"]
-    # Second run deletes listings from previous runs.
+    # Second run deletes it from the selling page via the card menu
+    # (user brief 2026-11-06: Delete Previous is the Relist & Edit
+    # menu workflow with "Delete listing" + confirm, not the old
+    # DB-driven delete of every previous-run listing).
+    MockDriver.fake_listings = [{"id": fb_id, "title": "PrevSofa title"}]
     rid2 = eng.start_run(start_cfg(db, gid, "delete_previous"))
     run_to_end(eng, rid2)
-    assert events("delete_listing"), MockDriver.calls
-    assert any(c["listing_id"] == fb_id for c in events("delete_listing"))
+    assert events("delete_previous"), MockDriver.calls
+    assert any(c["listing_id"] == fb_id and c.get("via_menu")
+               for c in events("delete_previous"))
+    assert not events("delete_listing"), \
+        "menu path must never fall back to the direct delete"
     deleted = db.fetchall("SELECT * FROM listings WHERE run_id = ? "
                           "AND status = 'deleted'", (rid2,))
     assert len(deleted) == 1 and deleted[0]["fb_listing_id"] == fb_id

@@ -95,6 +95,8 @@ class RunIn(BaseModel):
     publish_drafts_max_count: int = 3
     relist_edit_min_count: int = 1
     relist_edit_max_count: int = 3
+    delete_previous_min_count: int = 1
+    delete_previous_max_count: int = 3
     relist_edit_price_direction: str = "descending"
     relist_edit_price_delta: float = 3.0
     create_listings_count: int = 1

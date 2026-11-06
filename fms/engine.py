@@ -121,6 +121,8 @@ class RunConfig:
     publish_drafts_max_count: int = 3
     relist_edit_min_count: int = 1  # Relist & Edit: how many of the account's
     relist_edit_max_count: int = 3  # own selling-page listings to edit
+    delete_previous_min_count: int = 1  # Delete Previous: how many of the
+    delete_previous_max_count: int = 3  # account's own selling-page listings to delete
     relist_edit_price_direction: str = "descending"  # ascending | descending
     relist_edit_price_delta: float = 3.0  # price change amount (user's 2, 3, ...)
     create_listings_count: int = 1  # Create Listings Only: exact filled forms per account
@@ -191,6 +193,9 @@ class RunConfig:
         if (self.relist_edit_min_count < 1
                 or self.relist_edit_max_count < self.relist_edit_min_count):
             raise ValueError("bad relist_edit_min_count/relist_edit_max_count")
+        if (self.delete_previous_min_count < 1
+                or self.delete_previous_max_count < self.delete_previous_min_count):
+            raise ValueError("bad delete_previous_min_count/delete_previous_max_count")
         if str(self.relist_edit_price_direction).strip().lower() not in ("ascending", "descending"):
             raise ValueError("relist_edit_price_direction must be ascending or descending")
         if self.relist_edit_price_delta < 0:
@@ -239,6 +244,8 @@ class RunConfig:
             "publish_drafts_max_count": self.publish_drafts_max_count,
             "relist_edit_min_count": self.relist_edit_min_count,
             "relist_edit_max_count": self.relist_edit_max_count,
+            "delete_previous_min_count": self.delete_previous_min_count,
+            "delete_previous_max_count": self.delete_previous_max_count,
             "relist_edit_price_direction": self.relist_edit_price_direction,
             "relist_edit_price_delta": self.relist_edit_price_delta,
             "min_price": self.min_price, "max_price": self.max_price,
@@ -2108,26 +2115,106 @@ class RunController:
                  account_id=account["id"])
 
     def _delete_previous_flow(self, account: dict, driver) -> None:
-        """Delete listings posted by EARLIER runs (tracked in the DB)."""
+        """Delete Previous (user brief 2026-11-06): same selling-page
+        menu workflow as Relist & Edit, except each listing's card
+        menu is used to DELETE it ("Delete listing" + confirm) instead
+        of editing its price. Per account, in order: feed fully loaded
+        -> Marketplace loaded -> selling page loaded -> that account's
+        OWN first listing first, each listing's "..." menu opened,
+        "Delete listing" clicked, the delete dialog confirmed, repeat
+        until the Min-Max delete count for this account is done. No
+        product dataset is used; the selling page is the source. The
+        old DB-driven flow (delete ALL previous-run listings by
+        fb_listing_id) is replaced by this — the user asked for the
+        Relist & Edit workflow, with a Min/Max delete count, and
+        nothing else. Dialog shows only Min delete / Max delete.
+        Same start rule as Relist & Edit: as soon as ANY listing is
+        visible on the selling page, work starts at once on the first
+        visible listing in page order — no confirmation, no safety
+        gate, and NO link-identity verification in the menu step. The
+        card whose "..." was clicked is the listing being deleted.
+        A menu-step failure for a listing is a skip, NOT a silent
+        direct-URL retry — the menu method itself returns the skip,
+        and the flow never re-runs a failed listing directly. A
+        listing whose menu or confirm dialog genuinely cannot be
+        opened is skipped (nothing deleted) and the run continues
+        with the next listing; the account still ends Done. Returning
+        without raising lets the worker close the browser and move to
+        the next account, which restarts from its own first listing.
+        Discovery cap: at most 200 listings are collected (15 scroll
+        passes, ID deduplication, first-seen order); the run is
+        bounded only by the Min-Max count and the 200 cap."""
         label = account["label"]
-        rows = self.db.fetchall(
-            """SELECT id, fb_listing_id, title_used FROM listings
-               WHERE account_id = ? AND run_id != ? AND status = 'posted'
-                 AND fb_listing_id IS NOT NULL
-               ORDER BY id""",
-            (account["id"], self.run_id),
-        )
-        n = 0
-        for r in rows:
-            self._wait_if_paused()
-            if driver.delete_listing(r["fb_listing_id"]):
-                self._record_deleted(account, r["fb_listing_id"],
-                                     r["title_used"] or "")
-                n += 1
+        lo = max(1, int(self.cfg.delete_previous_min_count or 1))
+        hi = max(lo, int(self.cfg.delete_previous_max_count or lo))
+        want = random.randint(lo, hi)
+        # Delete Previous ONLY: the card-menu path. No fallback to
+        # the old direct delete — the user asked for the menu
+        # workflow, and a menu-step failure is a skip, not a silent
+        # direct-URL retry.
+        method = getattr(driver, "delete_previous_listing_via_menu", None)
+        if not callable(method):
+            self.log(f"[{label}] Delete Previous requires a menu-capable browser driver",
+                     level="error", account_id=account["id"])
+            return
+        driver.open_url("https://www.facebook.com/")
+        driver.open_marketplace()
+        driver.open_url("https://www.facebook.com/marketplace/you/selling/")
+        # Same selling-page discovery as Relist & Edit: wait for a
+        # visible listing before reading (unlimited wait, user order
+        # 2026-11-05). The shared get_my_listings() stays untouched
+        # for other actions.
+        scoped = getattr(driver, "relist_edit_get_selling_listings", None)
+        if callable(scoped):
+            listings = scoped() or []
+        else:
+            listings = driver.get_my_listings() or []
+        targets = [lst for lst in listings if lst.get("id")][:want]
+        diag = getattr(driver, "relist_edit_last_discovery", None)
+        if not targets:
+            if isinstance(diag, dict) and diag.get("path") is not None:
+                self.log(f"[{label}] Delete Previous discovery: "
+                         f"visible '...' buttons {diag.get('buttons_visible')}"
+                         f"/{diag.get('buttons_total')}, item links "
+                         f"{diag.get('links_visible')}"
+                         f"/{diag.get('links_total')} visible/total, "
+                         f"page {diag.get('url') or '?'} "
+                         f"({diag.get('title') or '?'})",
+                         account_id=account["id"])
+            self.log(f"[{label}] No selling listings available to delete; account marked Done",
+                     account_id=account["id"])
+            return
+        if isinstance(diag, dict) and diag.get("path"):
+            self.log(f"[{label}] Delete Previous: selling listings found via "
+                     f"{diag.get('path')} ({len(targets)} card(s))",
+                     account_id=account["id"])
+        if isinstance(diag, dict) and diag.get("cap_reached"):
+            self.log(f"[{label}] Delete Previous: discovery stopped at the "
+                     f"200-listing cap; listings beyond the cap, if any, "
+                     f"were not collected or processed",
+                     level="warning", account_id=account["id"])
+        deleted = 0
+        failed = 0
+        for lst in targets:
+            result = method(lst["id"])
+            if isinstance(result, dict) and result.get("ok"):
+                deleted += 1
+                self.log(f"[{label}] Delete Previous: deleted {lst['id']}",
+                         account_id=account["id"])
+                # Keep the DB truthful, as the other delete flows do:
+                # a link-backed listing has a real Facebook id; a
+                # card-token listing ("card:N") has none, so there is
+                # nothing to record for it.
+                if not str(lst["id"]).startswith("card:"):
+                    self._record_deleted(account, lst["id"],
+                                         lst.get("title", "") or "")
             else:
-                self.log(f"[{label}] could not delete {r['fb_listing_id']}",
+                failed += 1
+                reason = result.get("reason") if isinstance(result, dict) else "unknown"
+                self.log(f"[{label}] Delete Previous: skipped {lst['id']} ({reason}); nothing deleted",
                          level="warning", account_id=account["id"])
-        self.log(f"[{label}] deleted {n}/{len(rows)} previous listing(s)",
+        self.log(f"[{label}] Delete Previous: deleted {deleted}/{len(targets)} listing(s)"
+                 + (f" ({failed} skipped)" if failed else ""),
                  account_id=account["id"])
 
     def _delete_draft_flow(self, account: dict, driver) -> None:

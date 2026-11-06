@@ -210,6 +210,11 @@ F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED = (
     " or ancestor::*[@role='toolbar'])]")
 F_RELIST_EDIT_MENU_EDIT_LINK = ("css", "a:has-text('Edit listing'), "
                                      "[role='menuitem']:has-text('Edit listing')")
+# Delete Previous ONLY: the selling-page card menu's "Delete listing"
+# entry — same shape as the Edit listing entry, but clicking it opens
+# the delete confirmation dialog on the same page (no new tab).
+F_DELETE_PREVIOUS_MENU_DELETE_LINK = ("css", "a:has-text('Delete listing'), "
+                                      "[role='menuitem']:has-text('Delete listing')")
 # The listing detail dialog ("Your listing") that opens when a card —
 # not its "..." button — is clicked by mistake. Detected only so the
 # menu step can close it and retry the "..." click once (2026-11-05).
