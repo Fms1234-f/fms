@@ -934,6 +934,8 @@ class _FakeKeyboard:
         self.presses.append(key)
         if key == "Escape":
             self._page.detail_open = False
+            # Escape also closes an open action menu.
+            self._page.menu_open_index = None
 
 
 class _FakeDetailDialog:
@@ -989,13 +991,28 @@ class _FakeMenuEditLocator:
         return {"x": x, "y": 0, "width": 10, "height": 10}
 
     def wait_for(self, state=None, timeout=None):
+        if getattr(self._page, "close_menu_once_before_wait", False):
+            # The menu opened, then closed by itself while Facebook
+            # re-rendered the list — the Edit link is gone this time.
+            # One-shot: the retry's wait finds the menu again.
+            self._page.close_menu_once_before_wait = False
+            self._page.menu_open_index = None
+            raise RuntimeError("menu / Edit listing not visible")
         if (not self._page.edit_link_present
                 or self._page.menu_open_index is None):
             raise RuntimeError("menu / Edit listing not visible")
 
     def is_visible(self):
-        return (self._page.edit_link_present
-                and self._page.menu_open_index is not None)
+        if (not self._page.edit_link_present
+                or self._page.menu_open_index is None):
+            return False
+        # The menu renders a moment after the mousedown: when the
+        # page sets edit_visible_after, the first N looks miss it.
+        after = getattr(self._page, "edit_visible_after", 0)
+        if after > 0:
+            self._page.edit_visible_after = after - 1
+            return False
+        return True
 
     def get_attribute(self, name):
         if name != "href" or self._page.menu_open_index is None:
@@ -1296,6 +1313,63 @@ def test_playwright_menu_click_throws_but_menu_opened_proceeds(
     page = _menu_page()
     page.fail_clicks_first = 1
     page.fail_clicks_open_menu = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0], "menu opened on the failed click; no re-click"
+    assert tab.closed is True
+
+
+def test_playwright_menu_stale_menu_closed_before_listing_turn(
+        monkeypatch):
+    # 2026-11-06 live video: the previous listing's menu was still
+    # open when the next listing's turn started — it scrolled with
+    # the page and its Edit link belonged to the previous listing,
+    # editing it twice. The menu step must close any open menu
+    # before resolving this listing's "..." button.
+    # Card-token path.
+    page = _menu_page()
+    page.menu_open_index = 0  # stale menu from the previous listing
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:1", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L2&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [1], "only this listing's button clicked"
+    assert "Escape" in page.keyboard.presses, "stale menu closed first"
+    assert tab.closed is True
+
+
+def test_playwright_menu_closed_by_itself_retries_click_before_skip(
+        monkeypatch):
+    # 2026-11-06 live report: the menu opened, then closed by itself
+    # while Facebook re-rendered the list — the old code waited for
+    # an Edit link that would never come and skipped the listing
+    # without ever clicking Edit. The menu step must retry the "..."
+    # click once more before skipping.
+    # Card-token path.
+    page = _menu_page()
+    page.close_menu_once_before_wait = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0, 0], "first click, then one retry click"
+    assert tab.closed is True
+
+
+def test_playwright_menu_slow_render_found_by_menu_poll(monkeypatch):
+    # The menu renders a moment after the mousedown: a single
+    # instant menu check misses it. The menu check must wait
+    # briefly for the menu to appear.
+    # Card-token path.
+    page = _menu_page()
+    page.fail_clicks_first = 1
+    page.fail_clicks_open_menu = True
+    page.edit_visible_after = 2
     tab = _FakeTab(price_value="100")
     drv = _make_menu_driver(page, [tab], monkeypatch)
     res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)

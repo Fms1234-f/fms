@@ -4000,7 +4000,7 @@ class PlaywrightDriver(BaseDriver):
                 clicked = True
                 if _click_direct(clickable):
                     return True, None
-                if _menu_open():
+                if _menu_open(timeout_s=1.0):
                     return True, None
                 last_reason = "menu_button_not_found"
             return False, last_reason
@@ -4022,24 +4022,50 @@ class PlaywrightDriver(BaseDriver):
             except Exception:
                 return False
 
-        def _menu_open():
+        def _menu_open(timeout_s=0.0):
             """True if the listing's action menu is open right now.
 
             The menu is open when its "Edit listing" entry is
             visible — the same entry _wait_for_edit_link looks for.
             The listing detail dialog is not the menu: if "Your
-            listing" is open, the menu is not treated as open."""
+            listing" is open, the menu is not treated as open.
+            timeout_s: when > 0, keep checking for that long
+            instead of one instant look — the menu renders a
+            moment after the mousedown, so a single instant check
+            can miss a menu that is about to appear (2026-11-06)."""
             try:
                 if _detail_dialog_open():
                     return False
             except Exception:
                 pass
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            while True:
+                try:
+                    edit_loc = S.to_playwright(
+                        page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
+                    if edit_loc.is_visible():
+                        return True
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.25)
+
+        # A menu (or the detail dialog) left open by the previous
+        # listing must never survive into this listing's turn: it
+        # would scroll with the page, and its Edit link would be
+        # the previous listing's — editing it twice (2026-11-06
+        # live video: the first card's menu still open after 2
+        # listings were done). Close it before resolving this
+        # listing's "..." button. Runs once per listing, not per
+        # retry: the retries below must not close a menu that just
+        # opened.
+        if _menu_open() or _detail_dialog_open():
             try:
-                edit_loc = S.to_playwright(
-                    page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
-                return bool(edit_loc.is_visible())
+                page.keyboard.press("Escape")
             except Exception:
-                return False
+                pass
+            time.sleep(0.5)
 
         ok, reason = _click_menu_button()
         if not ok:
@@ -4050,17 +4076,26 @@ class PlaywrightDriver(BaseDriver):
         # 2026-11-03 simplified rule — a mismatch is not a skip).
         edit_loc = _wait_for_edit_link()
         if edit_loc is None:
-            # The click may have missed the "..." and opened the
-            # listing detail dialog instead (the 2026-11-05 live
-            # failure: 2 listings edited, then "Your listing" opened).
-            # Close it and try the "..." click once more, freshly
-            # resolved. If the menu still does not open, skip.
+            # The menu never opened, or it opened and closed by
+            # itself while Facebook re-rendered the list (the
+            # 2026-11-06 live report: menu seen open, Edit listing
+            # never clicked). The click may also have missed the
+            # "..." and opened the listing detail dialog instead
+            # (the 2026-11-05 live failure: 2 listings edited, then
+            # "Your listing" opened) — close that first. Either
+            # way, retry the "..." click once more before skipping:
+            # a listing is skipped only when its menu genuinely
+            # cannot be opened (user rule 2026-11-06: menu open
+            # means Edit listing must be clicked). Never re-click
+            # while the menu is already open — that would only
+            # toggle it shut.
             if _detail_dialog_open():
                 try:
                     page.keyboard.press("Escape")
                 except Exception:
                     pass
                 time.sleep(1)
+            if not _menu_open():
                 ok, _reason = _click_menu_button()
                 if ok:
                     edit_loc = _wait_for_edit_link()
