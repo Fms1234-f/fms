@@ -4289,6 +4289,109 @@ class PlaywrightDriver(BaseDriver):
                 time.sleep(0.5)
             return False
 
+        def _snapshot_cards():
+            """[(button, card_text)] for every visible "..." button,
+            in current page order. A button's card text is its card's
+            normalized text — the listing's identity, stable across
+            re-renders that only move cards around. Locators, not
+            handles: a handle resolved a moment ago can go stale
+            while the list re-renders, but a fresh nth() locator
+            re-resolves against the current DOM."""
+            _ancestor_with_button = (
+                "xpath=ancestor::*[count(.//*["
+                + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
+            out = []
+            try:
+                loc = page.locator(
+                    "xpath="
+                    + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1])
+                count = loc.count()
+            except Exception:
+                return out
+            for i in range(count):
+                btn = loc.nth(i)
+                try:
+                    if not btn.is_visible():
+                        continue
+                except Exception:
+                    continue
+                text = ""
+                try:
+                    card = btn.locator(_ancestor_with_button)
+                    if card.count():
+                        raw = card.first.inner_text() or ""
+                        text = " ".join(str(raw).split()).lower()[:120]
+                except Exception:
+                    text = ""
+                out.append((btn, text))
+            return out
+
+        def _button_for_text(expected):
+            """The "..." button whose card text matches `expected`
+            in a fresh snapshot, or None. The selling list
+            re-renders after a delete / dialog cycle, so a button
+            resolved a moment ago (by position) can now belong to a
+            different card; clicking it opens that card's detail
+            ("View listing") instead of this listing's menu
+            (2026-11-06 live runs)."""
+            if not expected:
+                return None
+            try:
+                snap = _snapshot_cards()
+            except Exception:
+                return None
+            for btn, text in snap:
+                if text and text == expected:
+                    return btn
+            return None
+
+        def _survey_open():
+            """True if the 'Did you sell this item?' survey dialog
+            is open right now. It appears after the confirmation
+            Delete is clicked, instead of the dialog closing — and
+            it covers the page, blocking every "..." click for the
+            rest of the run until it is closed (2026-11-06 live
+            run)."""
+            try:
+                matches = page.locator(
+                    S.F_DELETE_PREVIOUS_SURVEY_DIALOG[1]).all()
+            except Exception:
+                return False
+            for cand in matches:
+                try:
+                    if cand.is_visible():
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _close_survey():
+            """Close the survey dialog (its X button), falling back
+            to Escape. Returns True when the survey is gone."""
+            if not _survey_open():
+                return True
+            try:
+                matches = page.locator(
+                    S.F_DELETE_PREVIOUS_SURVEY_CLOSE_BUTTON[1]).all()
+                for cand in matches:
+                    try:
+                        if cand.is_visible():
+                            cand.click(timeout=3000)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            time.sleep(0.5)
+            if not _survey_open():
+                return True
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(0.5)
+            return not _survey_open()
+
         def _resolve_button():
             """Re-find this listing's "..." button fresh.
 
@@ -4471,9 +4574,27 @@ class PlaywrightDriver(BaseDriver):
                 if clickable is None:
                     last_reason = reason
                     continue
+                # Capture this card's identity BEFORE scrolling: the
+                # list can shift while scrolling, so the button
+                # resolved above is re-found by its card's own text
+                # right before the click (below), never by a stale
+                # position.
+                _expected_text = ""
+                if str(listing_id).startswith("card:"):
+                    try:
+                        _idx = int(str(listing_id)[5:])
+                        _snap0 = _snapshot_cards()
+                        if 0 <= _idx < len(_snap0):
+                            _expected_text = _snap0[_idx][1]
+                    except Exception:
+                        _expected_text = ""
                 if not _bring_into_view(clickable):
                     last_reason = "menu_button_not_visible"
                     continue
+                if _expected_text:
+                    _fresh = _button_for_text(_expected_text)
+                    if _fresh is not None:
+                        clickable = _fresh
                 clicked = True
                 if _click_direct(clickable):
                     # A click that returns normally is not proof the
@@ -4529,7 +4650,12 @@ class PlaywrightDriver(BaseDriver):
         # before resolving this listing's "..." button. Runs once
         # per listing, not per retry: the retries below must not
         # close a menu that just opened.
-        if _menu_open() or _detail_dialog_open() or _confirm_open():
+        if _survey_open():
+            # A survey left open by the previous listing's delete
+            # covers the page: close it with its X before anything
+            # else, or every "..." click below is blocked.
+            _close_survey()
+        elif _menu_open() or _detail_dialog_open() or _confirm_open():
             try:
                 page.keyboard.press("Escape")
             except Exception:
@@ -4538,11 +4664,14 @@ class PlaywrightDriver(BaseDriver):
 
         ok, reason = _click_menu_button()
         if not ok:
-            # Never leave a menu / detail / confirm dialog open
-            # behind a skipped listing: the next listing's turn
-            # would start behind it, and the last listing's detail
-            # would stay open on screen (2026-11-06 live run).
-            if _menu_open() or _detail_dialog_open() or _confirm_open():
+            # Never leave a menu / detail / confirm / survey
+            # dialog open behind a skipped listing: the next
+            # listing's turn would start behind it, and the last
+            # listing's detail would stay open on screen
+            # (2026-11-06 live run).
+            if _survey_open():
+                _close_survey()
+            elif _menu_open() or _detail_dialog_open() or _confirm_open():
                 try:
                     page.keyboard.press("Escape")
                 except Exception:
@@ -4613,11 +4742,14 @@ class PlaywrightDriver(BaseDriver):
             # here covers the page and blocks every "..." click for
             # the rest of the run (2026-11-06 live run: 0/5, the
             # dialog stayed open on the first listing).
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            time.sleep(0.5)
+            if _survey_open():
+                _close_survey()
+            else:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                time.sleep(0.5)
             return _skip("delete_confirm_not_found")
         try:
             confirm_loc.click(timeout=5000)
@@ -4627,7 +4759,15 @@ class PlaywrightDriver(BaseDriver):
         # the proof the delete went through: the click can throw
         # after Facebook already removed the listing and re-rendered.
         # Wait up to ~5s for the dialog (and the menu) to be gone.
+        # The dialog may instead turn into the "Did you sell this
+        # item?" survey: its Delete button is gone, so the old check
+        # passed while the survey stayed open and blocked the rest
+        # of the run (2026-11-06 live run). Close the survey with
+        # its X (the user asked for the cross, not an answer), then
+        # the delete is proven only once everything is gone.
         for _ in range(20):
+            if _survey_open():
+                _close_survey()
             try:
                 confirm_visible = confirm_loc.is_visible()
             except Exception:
@@ -4636,10 +4776,16 @@ class PlaywrightDriver(BaseDriver):
                 menu_still_open = _menu_open()
             except Exception:
                 menu_still_open = False
-            if not confirm_visible and not menu_still_open:
+            if (not confirm_visible and not menu_still_open
+                    and not _survey_open()):
                 return {"ok": True, "listing_id": listing_id,
                         "reason": None}
             time.sleep(0.25)
+        if _survey_open():
+            _close_survey()
+            if not _survey_open():
+                return {"ok": True, "listing_id": listing_id,
+                        "reason": None}
         return _skip("delete_confirm_not_found")
 
     # -- Phase 2: scrap (read-only) -------------------------------------------------

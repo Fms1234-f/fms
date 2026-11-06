@@ -144,6 +144,18 @@ F_DELETE_PREVIOUS_CONFIRM_BUTTON = (
     "button[type='submit'], [role='dialog'] button:has-text('Delete'), "
     "[role='dialog'] [role='button']:has-text('Delete'), "
     "[role='alertdialog'] [role='button']:has-text('Delete')")
+# Delete Previous ONLY: after the confirmation Delete is clicked,
+# Facebook shows a "Did you sell this item?" survey dialog (radio
+# options + Next) instead of closing the dialog. It must be closed
+# (X) before the next listing, or it covers the page and blocks
+# every "..." click for the rest of the run (2026-11-06 live run).
+F_DELETE_PREVIOUS_SURVEY_DIALOG = (
+    "css", "[role='dialog']:has-text('Did you sell this item?')")
+F_DELETE_PREVIOUS_SURVEY_CLOSE_BUTTON = (
+    "css", "[role='dialog']:has-text('Did you sell this item?') "
+    "[aria-label='Close'][role='button'], "
+    "[role='dialog']:has-text('Did you sell this item?') "
+    "[aria-label='Close']")
 F_RENEW_BUTTON = ("css", "div[aria-label*='Renew' i][role='button'], "
                          "span:has-text('Renew listing')")
 

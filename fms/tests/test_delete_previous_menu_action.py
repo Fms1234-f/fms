@@ -246,6 +246,8 @@ class _FakeKeyboard:
             self._page.menu_open_index = None
             if getattr(self._page, "escape_closes_confirm", True):
                 self._page.confirm_open = False
+            if getattr(self._page, "escape_closes_survey", True):
+                self._page.survey_open = False
 
 
 class _FakeMenuLinkHandle:
@@ -283,9 +285,17 @@ class _FakeDeleteButton:
     def __init__(self, page, index):
         self._page = page
         self._index = index
+        # A button created before the list re-rendered (the
+        # detach flag went up) is detached; one created after is
+        # fresh and clickable.
+        self._created_before_detach = not getattr(
+            page, "buttons_detached", False)
 
     def scroll_into_view_if_needed(self, timeout=None):
-        pass
+        if getattr(self._page, "detach_buttons_on_scroll", False):
+            # Facebook re-rendered the list while scrolling: every
+            # "..." button resolved before this scroll is detached.
+            self._page.buttons_detached = True
 
     def wait_for(self, state=None, timeout=None):
         return None
@@ -296,7 +306,24 @@ class _FakeDeleteButton:
     def bounding_box(self):
         return getattr(self._page, "button_box", None)
 
+    def locator(self, sel):
+        # The button's own card (nearest ancestor holding a menu
+        # button): its text identifies the listing.
+        return _FakeCardAncestor(self._page, self._index)
+
     def click(self, delay=None, timeout=None):
+        if getattr(self._page, "buttons_detached", False) and getattr(
+                self, "_created_before_detach", True):
+            # A handle resolved before the list re-rendered is
+            # detached: Playwright's click throws on it.
+            self._page.menu_clicks.append(self._index)
+            raise RuntimeError("element detached")
+        if getattr(self._page, "survey_open", False):
+            # The survey dialog is a modal overlay: it covers the
+            # page, so no "..." button can receive the click.
+            self._page.menu_clicks.append(self._index)
+            raise RuntimeError(
+                "click timeout: element covered by survey dialog")
         if getattr(self._page, "confirm_open", False):
             # The delete confirmation dialog is a modal overlay: it
             # covers the page, so no "..." button can receive the
@@ -334,6 +361,24 @@ class _FakeDeleteButton:
             self._page.menu_card_index = self._index
 
 
+class _FakeCardAncestor:
+    """A "..." button's own card: its text identifies the listing."""
+
+    def __init__(self, page, index):
+        self._page = page
+        self._index = index
+
+    def count(self):
+        return 1
+
+    @property
+    def first(self):
+        return self
+
+    def inner_text(self):
+        return self._page.card_text(self._index)
+
+
 class _FakeButtonCollection:
     def __init__(self, page, index):
         self._page = page
@@ -353,6 +398,14 @@ class _FakeButtonCollection:
 class _FakeDeleteButtons:
     def __init__(self, page):
         self._page = page
+
+    def count(self):
+        if self._page.buttons_missing:
+            return 0
+        return len(self._page.cards)
+
+    def nth(self, index):
+        return _FakeDeleteButton(self._page, index)
 
     def all(self):
         if self._page.buttons_missing:
@@ -427,6 +480,10 @@ class _FakeConfirmButton:
         idx = self._page.menu_card_index
         if idx is not None and 0 <= idx < len(self._page.cards):
             self._page.deleted.append(self._page.cards.pop(idx))
+        if getattr(self._page, "survey_opens", False):
+            # Facebook shows the "Did you sell this item?" survey
+            # instead of closing the dialog (2026-11-06 live run).
+            self._page.survey_open = True
 
 
 class _FakeHiddenSubmitButton:
@@ -493,6 +550,42 @@ class _FakeConfirmMissingCollection:
         return [_FakeConfirmMissingButton()]
 
 
+class _FakeSurveyDialog:
+    def __init__(self, page):
+        self._page = page
+
+    def is_visible(self):
+        return bool(getattr(self._page, "survey_open", False))
+
+
+class _FakeSurveyDialogCollection:
+    def __init__(self, page):
+        self._page = page
+
+    def all(self):
+        return [_FakeSurveyDialog(self._page)]
+
+
+class _FakeSurveyCloseButton:
+    def __init__(self, page):
+        self._page = page
+
+    def is_visible(self):
+        return bool(getattr(self._page, "survey_open", False))
+
+    def click(self, delay=None, timeout=None):
+        self._page.survey_close_clicks.append(True)
+        self._page.survey_open = False
+
+
+class _FakeSurveyCloseCollection:
+    def __init__(self, page):
+        self._page = page
+
+    def all(self):
+        return [_FakeSurveyCloseButton(self._page)]
+
+
 class _FakeDetailDialog:
     def __init__(self, page):
         self._page = page
@@ -515,7 +608,8 @@ class _FakeDeletePage:
 
     def __init__(self, card_ids, card_hrefs=None, buttons_missing=False,
                  menu_opens=True, delete_link_present=True,
-                 confirm_opens=True, confirm_form="aria_label_div"):
+                 confirm_opens=True, confirm_form="aria_label_div",
+                 card_titles=None):
         self.cards = list(card_ids)
         self.card_hrefs = list(card_hrefs or
                                [f"https://www.facebook.com/marketplace/item/{i}/"
@@ -547,8 +641,28 @@ class _FakeDeletePage:
         self.button_box = None
         self.button_visible = True
         self.viewport_size = {"width": 800, "height": 600}
+        self.survey_open = False
+        self.survey_opens = False
+        self.survey_close_clicks = []
+        self.escape_closes_survey = True
+        self.buttons_detached = False
+        self.detach_buttons_on_scroll = False
+        # Each card's own text (title): its identity across
+        # re-renders. Distinct per card by default.
+        self.card_titles = dict(card_titles or {
+            cid: f"TITLE {cid} £2" for cid in card_ids})
+
+    def card_text(self, index):
+        if 0 <= index < len(self.cards):
+            return self.card_titles.get(self.cards[index], "")
+        return ""
 
     def locator(self, sel):
+        if "Did you sell this item?" in sel:
+            # The survey dialog and its X (close) button.
+            if "Close" in sel:
+                return _FakeSurveyCloseCollection(self)
+            return _FakeSurveyDialogCollection(self)
         if "/marketplace/item/" in sel:
             return _FakeMenuLinks(self)
         if "..." in sel:
@@ -775,3 +889,49 @@ def test_delete_previous_detail_always_opening_closes_at_skip(monkeypatch):
     assert page.deleted == []
     assert not page.detail_open, "detail must not stay open after the skip"
     assert "Escape" in page.keyboard.presses
+
+
+def test_delete_previous_survey_closed_after_delete(monkeypatch):
+    # 2026-11-06 live run (v0.2.207): after the Delete click,
+    # Facebook shows the "Did you sell this item?" survey instead
+    # of closing the dialog. FMS must cross it (X) and only then
+    # count the listing deleted — the survey must not stay open
+    # and block the next listing.
+    page = _delete_page()
+    page.survey_opens = True
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res == {"ok": True, "listing_id": "card:0", "reason": None}
+    assert page.deleted == ["card:0"]
+    assert not page.survey_open, "survey crossed, not left open"
+    assert page.survey_close_clicks == [True], "survey X clicked"
+
+
+def test_delete_previous_stale_survey_closed_before_turn(monkeypatch):
+    # A survey left open by the previous listing's delete must be
+    # crossed before this listing's "..." button is touched, or
+    # the modal overlay blocks every click below it.
+    page = _delete_page()
+    page.survey_open = True
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res["ok"] is True
+    assert page.deleted == ["card:0"]
+    assert page.survey_close_clicks == [True], "stale survey crossed first"
+    assert page.menu_clicks == [0], "only this listing's ... clicked"
+    assert not page.survey_open
+
+
+def test_delete_previous_reanchor_after_scroll_shift(monkeypatch):
+    # The list re-renders while scrolling to the "..." button: the
+    # button resolved a moment ago is detached, and clicking it
+    # throws. The click must re-anchor on the card's own text and
+    # hit the right listing's "..." button on the first attempt —
+    # never a stale handle, never another card's detail.
+    page = _delete_page()
+    page.detach_buttons_on_scroll = True
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res == {"ok": True, "listing_id": "card:0", "reason": None}
+    assert page.deleted == ["card:0"]
+    assert page.menu_clicks == [0], "one click, re-anchored, no retry"
