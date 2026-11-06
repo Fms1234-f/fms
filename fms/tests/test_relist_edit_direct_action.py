@@ -894,8 +894,14 @@ class _FakeMenuButton:
             # 2026-11-06 live failure: the "..." click itself times out
             # (button caught mid re-render) — the attempt is recorded,
             # then it raises so the caller can retry with a fresh
-            # resolve instead of burning one long wait.
+            # resolve instead of burning one long wait. When
+            # fail_clicks_open_menu is set, the mousedown opened the
+            # menu before the re-render detached the button and the
+            # click threw — the menu IS open even though the click
+            # failed.
             self._page.fail_clicks_first -= 1
+            if getattr(self._page, "fail_clicks_open_menu", False):
+                self._page.menu_open_index = self._index
             raise RuntimeError("click timeout")
         if (getattr(self._page, "detail_opens_first_click", False)
                 and first_click):
@@ -986,6 +992,10 @@ class _FakeMenuEditLocator:
         if (not self._page.edit_link_present
                 or self._page.menu_open_index is None):
             raise RuntimeError("menu / Edit listing not visible")
+
+    def is_visible(self):
+        return (self._page.edit_link_present
+                and self._page.menu_open_index is not None)
 
     def get_attribute(self, name):
         if name != "href" or self._page.menu_open_index is None:
@@ -1272,6 +1282,26 @@ def test_playwright_menu_click_timeout_retried_with_fresh_resolve(
     assert res["ok"] is True and res["new_price"] == 97.0
     assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
     assert page.menu_clicks == [0, 0], "first click timed out, retry clicked"
+    assert tab.closed is True
+
+
+def test_playwright_menu_click_throws_but_menu_opened_proceeds(
+        monkeypatch):
+    # 2026-11-06 live failure: the "..." click opened the menu, then
+    # threw when Facebook re-rendered the card — the old code treated
+    # the click as failed, re-clicked "..." (toggling the menu shut)
+    # and skipped the listing. The menu step must check whether the
+    # menu actually opened and use it instead of re-clicking.
+    # Card-token path.
+    page = _menu_page()
+    page.fail_clicks_first = 1
+    page.fail_clicks_open_menu = True
+    tab = _FakeTab(price_value="100")
+    drv = _make_menu_driver(page, [tab], monkeypatch)
+    res = drv.relist_edit_listing_price_via_menu("card:0", "descending", 3)
+    assert res["ok"] is True and res["new_price"] == 97.0
+    assert tab.gotos == [EDIT_URL + "L1&from_menu=1"], tab.gotos
+    assert page.menu_clicks == [0], "menu opened on the failed click; no re-click"
     assert tab.closed is True
 
 

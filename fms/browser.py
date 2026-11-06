@@ -3969,11 +3969,27 @@ class PlaywrightDriver(BaseDriver):
             a moment later (2026-11-06 live run: card:2 skipped
             menu_button_not_found exactly 15s after card:1, the old
             single 15s click timeout). Each attempt first waits for
-            the list to settle, then resolves fresh. Returns
-            (True, None) or (False, reason)."""
+            the list to settle, then resolves fresh.
+
+            A click is NOT the proof the menu opened: the mousedown
+            opens the menu and Facebook's re-render can detach the
+            button before the click finishes, so the click throws
+            even though the menu toggled (2026-11-06 live run: the
+            menu was seen opening, yet the listing skipped). After a
+            click, and before any re-click, check whether the menu
+            actually opened — if it did, the click succeeded. Never
+            click "..." while the menu this turn opened is still
+            open: that click would only toggle it shut again. Only a
+            menu this turn itself opened counts (the `clicked` flag),
+            so a stale menu from the previous listing can never pass
+            the check untouched. Returns (True, None) or
+            (False, reason)."""
             last_reason = "menu_button_not_found"
+            clicked = False
             for _attempt in range(3):
                 _wait_for_list_settled()
+                if clicked and _menu_open():
+                    return True, None
                 clickable, reason = _resolve_button()
                 if clickable is None:
                     last_reason = reason
@@ -3981,7 +3997,10 @@ class PlaywrightDriver(BaseDriver):
                 if not _bring_into_view(clickable):
                     last_reason = "menu_button_not_visible"
                     continue
+                clicked = True
                 if _click_direct(clickable):
+                    return True, None
+                if _menu_open():
                     return True, None
                 last_reason = "menu_button_not_found"
             return False, last_reason
@@ -4000,6 +4019,25 @@ class PlaywrightDriver(BaseDriver):
                 dlg = S.to_playwright(
                     page, S.F_RELIST_EDIT_DETAIL_DIALOG)
                 return bool(dlg.is_visible())
+            except Exception:
+                return False
+
+        def _menu_open():
+            """True if the listing's action menu is open right now.
+
+            The menu is open when its "Edit listing" entry is
+            visible — the same entry _wait_for_edit_link looks for.
+            The listing detail dialog is not the menu: if "Your
+            listing" is open, the menu is not treated as open."""
+            try:
+                if _detail_dialog_open():
+                    return False
+            except Exception:
+                pass
+            try:
+                edit_loc = S.to_playwright(
+                    page, S.F_RELIST_EDIT_MENU_EDIT_LINK)
+                return bool(edit_loc.is_visible())
             except Exception:
                 return False
 
