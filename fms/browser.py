@@ -4357,14 +4357,41 @@ class PlaywrightDriver(BaseDriver):
             except Exception:
                 return None
 
-        def _wait_for_confirm_button():
-            confirm_loc = S.to_playwright(
-                page, S.F_DELETE_PREVIOUS_CONFIRM_BUTTON)
+        def _visible_confirm_button():
+            """First VISIBLE match of the confirm selector, or None.
+
+            The dialog is rendered last in <body>, so .first can lock
+            onto an earlier HIDDEN match (e.g. the search form's
+            submit button) and wait_for() then times out even though
+            the dialog's Delete is right there, visible — the 0/5
+            (v0.2.205) and 0/4 (v0.2.206) live runs failed exactly
+            this way; adding selector alternatives could never fix
+            it, because the dialog can never be .first while an
+            earlier match exists. Scan every match and take the
+            first one that is actually visible.
+            """
             try:
-                confirm_loc.wait_for(state="visible", timeout=5000)
-                return confirm_loc
+                matches = page.locator(
+                    S.F_DELETE_PREVIOUS_CONFIRM_BUTTON[1]).all()
             except Exception:
                 return None
+            for cand in matches:
+                try:
+                    if cand.is_visible():
+                        return cand
+                except Exception:
+                    continue
+            return None
+
+        def _wait_for_confirm_button():
+            deadline = time.monotonic() + 5
+            while True:
+                found = _visible_confirm_button()
+                if found is not None:
+                    return found
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.25)
 
         def _confirm_open():
             """True if the delete confirmation dialog is open right now.
@@ -4374,12 +4401,7 @@ class PlaywrightDriver(BaseDriver):
             the menu/detail checks alone never see it — the 2026-11-06
             live run left it open after a skip and it then blocked
             every "..." click for the rest of the run."""
-            try:
-                confirm_loc = S.to_playwright(
-                    page, S.F_DELETE_PREVIOUS_CONFIRM_BUTTON)
-                return bool(confirm_loc.is_visible())
-            except Exception:
-                return False
+            return _visible_confirm_button() is not None
 
         def _detail_dialog_open():
             try:
@@ -4454,6 +4476,20 @@ class PlaywrightDriver(BaseDriver):
                     continue
                 clicked = True
                 if _click_direct(clickable):
+                    # A click that returns normally is not proof the
+                    # menu opened: it may have opened the listing
+                    # detail ("View listing") instead — the 2026-11-06
+                    # live run (card:3) did exactly that, then burned
+                    # two 15s Delete-link waits behind the open
+                    # detail. Check what actually opened first.
+                    if _detail_dialog_open():
+                        try:
+                            page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                        clicked = False
+                        continue
                     return True, None
                 if _menu_open(timeout_s=1.0):
                     return True, None
@@ -4466,6 +4502,20 @@ class PlaywrightDriver(BaseDriver):
                     # plainly instead of the misleading
                     # menu_button_not_found.
                     last_reason = "confirm_dialog_open"
+                    continue
+                if _detail_dialog_open():
+                    # The click missed the "..." and opened the
+                    # listing detail ("View listing") instead of the
+                    # menu — the 2026-11-06 live run left it open and
+                    # burned every retry scrolling underneath it.
+                    # Close it now and re-resolve fresh; no menu
+                    # opened, so the clicked flag goes back to False.
+                    try:
+                        page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    clicked = False
                     continue
                 last_reason = "menu_button_not_found"
             return False, last_reason
@@ -4488,6 +4538,16 @@ class PlaywrightDriver(BaseDriver):
 
         ok, reason = _click_menu_button()
         if not ok:
+            # Never leave a menu / detail / confirm dialog open
+            # behind a skipped listing: the next listing's turn
+            # would start behind it, and the last listing's detail
+            # would stay open on screen (2026-11-06 live run).
+            if _menu_open() or _detail_dialog_open() or _confirm_open():
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                time.sleep(0.5)
             return _skip(reason)
         # 2. The menu's "Delete listing" entry. NO identity check:
         # the card whose "..." was clicked is the listing being

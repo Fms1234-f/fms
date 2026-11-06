@@ -304,6 +304,12 @@ class _FakeDeleteButton:
             # times out.
             self._page.menu_clicks.append(self._index)
             raise RuntimeError("click timeout: element covered by dialog")
+        if getattr(self._page, "detail_open", False):
+            # The listing detail dialog is a modal overlay too: it
+            # covers the page the same way.
+            self._page.menu_clicks.append(self._index)
+            raise RuntimeError(
+                "click timeout: element covered by detail dialog")
         first_click = len(self._page.menu_clicks) == 0
         self._page.menu_clicks.append(self._index)
         if getattr(self._page, "fail_clicks_first", 0) > 0:
@@ -316,6 +322,11 @@ class _FakeDeleteButton:
                 and first_click):
             # Missed "..." click: the listing detail dialog opens
             # instead of the menu.
+            self._page.detail_open = True
+            return
+        if getattr(self._page, "detail_opens_every_click", False):
+            # Every "..." click misses and opens the listing detail
+            # instead of the menu (2026-11-06 live run, card:3).
             self._page.detail_open = True
             return
         if self._page.menu_opens:
@@ -418,13 +429,40 @@ class _FakeConfirmButton:
             self._page.deleted.append(self._page.cards.pop(idx))
 
 
+class _FakeHiddenSubmitButton:
+    """An earlier match the confirm selector catches but that is
+    never visible — e.g. the search form's submit button at the top
+    of the selling page. The dialog is rendered last in <body>, so
+    .first locks onto this hidden element and wait_for() times out
+    even though the dialog's Delete is right there, visible — the
+    0/5 (v0.2.205) and 0/4 (v0.2.206) live runs."""
+
+    def wait_for(self, state=None, timeout=None):
+        raise RuntimeError("hidden submit never visible")
+
+    def is_visible(self):
+        return False
+
+    def click(self, delay=None, timeout=None):
+        raise RuntimeError("hidden submit never visible")
+
+
 class _FakeConfirmCollection:
     def __init__(self, page):
         self._page = page
 
     @property
     def first(self):
+        if getattr(self._page, "hidden_submit_before_dialog", False):
+            return _FakeHiddenSubmitButton()
         return _FakeConfirmButton(self._page)
+
+    def all(self):
+        out = []
+        if getattr(self._page, "hidden_submit_before_dialog", False):
+            out.append(_FakeHiddenSubmitButton())
+        out.append(_FakeConfirmButton(self._page))
+        return out
 
 
 class _FakeConfirmMissingButton:
@@ -450,6 +488,9 @@ class _FakeConfirmMissingCollection:
     @property
     def first(self):
         return _FakeConfirmMissingButton()
+
+    def all(self):
+        return [_FakeConfirmMissingButton()]
 
 
 class _FakeDetailDialog:
@@ -501,6 +542,8 @@ class _FakeDeletePage:
         self.keyboard = _FakeKeyboard(self)
         self.detail_open = False
         self.detail_opens_first_click = False
+        self.detail_opens_every_click = False
+        self.hidden_submit_before_dialog = False
         self.button_box = None
         self.button_visible = True
         self.viewport_size = {"width": 800, "height": 600}
@@ -696,4 +739,39 @@ def test_delete_previous_detail_dialog_closed_and_retried(monkeypatch):
     res = drv.delete_previous_listing_via_menu("card:0")
     assert res["ok"] is True
     assert page.deleted == ["card:0"]
+    assert "Escape" in page.keyboard.presses
+    assert page.menu_clicks == [0, 0], (
+        "detail closed and retried inside the menu loop — the "
+        "main-flow retry must not be spent on it")
+    assert not page.detail_open
+
+
+def test_delete_previous_confirm_hidden_earlier_match_still_deletes(monkeypatch):
+    # 2026-11-06 live runs (0/5 on v0.2.205, 0/4 on v0.2.206): the
+    # dialog's Delete is visible, but .first locks onto an earlier
+    # hidden match (the search form's submit button) and the visible
+    # wait times out. The confirm lookup must take the first VISIBLE
+    # match, not the first match.
+    page = _delete_page()
+    page.hidden_submit_before_dialog = True
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res == {"ok": True, "listing_id": "card:0", "reason": None}
+    assert page.deleted == ["card:0"]
+    assert page.confirm_clicks == [True], (
+        "dialog Delete clicked, not the hidden submit")
+
+
+def test_delete_previous_detail_always_opening_closes_at_skip(monkeypatch):
+    # 2026-11-06 live run (card:3): every "..." click opens the
+    # listing detail ("View listing") instead of the menu, and the
+    # run left it open on screen. The skip must end with the detail
+    # closed, never left open behind the run.
+    page = _delete_page()
+    page.detail_opens_every_click = True
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res["ok"] is False and res["reason"] == "menu_button_not_found"
+    assert page.deleted == []
+    assert not page.detail_open, "detail must not stay open after the skip"
     assert "Escape" in page.keyboard.presses
