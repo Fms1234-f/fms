@@ -240,8 +240,12 @@ class _FakeKeyboard:
         self.presses.append(key)
         if key == "Escape":
             self._page.detail_open = False
-            # Escape also closes an open action menu.
+            # Escape also closes an open action menu and the delete
+            # confirmation dialog — unless the page says Escape does
+            # not close the dialog (models a dialog that stays up).
             self._page.menu_open_index = None
+            if getattr(self._page, "escape_closes_confirm", True):
+                self._page.confirm_open = False
 
 
 class _FakeMenuLinkHandle:
@@ -293,6 +297,13 @@ class _FakeDeleteButton:
         return getattr(self._page, "button_box", None)
 
     def click(self, delay=None, timeout=None):
+        if getattr(self._page, "confirm_open", False):
+            # The delete confirmation dialog is a modal overlay: it
+            # covers the page, so no "..." button can receive the
+            # click (Playwright's actionability check) — the click
+            # times out.
+            self._page.menu_clicks.append(self._index)
+            raise RuntimeError("click timeout: element covered by dialog")
         first_click = len(self._page.menu_clicks) == 0
         self._page.menu_clicks.append(self._index)
         if getattr(self._page, "fail_clicks_first", 0) > 0:
@@ -568,6 +579,7 @@ def test_delete_previous_confirm_missing_skips(monkeypatch):
     assert res["ok"] is False and res["reason"] == "delete_confirm_not_found"
     assert page.deleted == []
     assert page.delete_clicks == [0], "Delete entry clicked, no confirm came"
+    assert page.keyboard.presses == ["Escape"], "open dialog closed on skip"
 
 
 def test_delete_previous_click_throws_but_menu_opened_deletes(monkeypatch):
@@ -588,6 +600,39 @@ def test_delete_previous_slow_rendering_menu_found(monkeypatch):
     res = drv.delete_previous_listing_via_menu("card:0")
     assert res["ok"] is True
     assert page.deleted == ["card:0"]
+
+
+def test_delete_previous_stale_confirm_closed_before_turn(monkeypatch):
+    page = _delete_page()
+    page.confirm_open = True  # stale dialog from the previous listing
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res["ok"] is True
+    assert page.deleted == ["card:0"]
+    assert page.keyboard.presses == ["Escape"], "stale dialog closed first"
+    assert page.menu_clicks == [0], "only this listing's ... button clicked"
+
+
+def test_delete_previous_confirm_blocking_menu_click_honest_reason(monkeypatch):
+    page = _delete_page()
+    page.confirm_open = True  # dialog stays up: Escape does not close it
+    page.escape_closes_confirm = False
+    drv = _make_delete_driver(page, monkeypatch)
+    res = drv.delete_previous_listing_via_menu("card:0")
+    assert res["ok"] is False and res["reason"] == "confirm_dialog_open"
+    assert page.deleted == []
+    assert page.menu_clicks == [0, 0, 0], "three attempts, all blocked"
+
+
+def test_confirm_selector_covers_dialog_button_form():
+    from fms import selectors as S
+    sel = S.F_DELETE_PREVIOUS_CONFIRM_BUTTON[1]
+    assert "[role='dialog'] button:has-text('Delete')" in sel
+    assert "div[aria-label='Delete'][role='button']" in sel
+    src = (ROOT / "browser.py").read_text(encoding="utf-8")
+    assert "F_DELETE_PREVIOUS_CONFIRM_BUTTON" in src
+    # The old selector is untouched — the other delete flows use it.
+    assert "F_CONFIRM_DELETE_BUTTON" in src
 
 
 def test_delete_previous_detail_dialog_closed_and_retried(monkeypatch):

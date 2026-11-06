@@ -4359,12 +4359,27 @@ class PlaywrightDriver(BaseDriver):
 
         def _wait_for_confirm_button():
             confirm_loc = S.to_playwright(
-                page, S.F_CONFIRM_DELETE_BUTTON)
+                page, S.F_DELETE_PREVIOUS_CONFIRM_BUTTON)
             try:
                 confirm_loc.wait_for(state="visible", timeout=5000)
                 return confirm_loc
             except Exception:
                 return None
+
+        def _confirm_open():
+            """True if the delete confirmation dialog is open right now.
+
+            The dialog is open when its Delete button is visible.
+            It is NOT the action menu and NOT the detail dialog, so
+            the menu/detail checks alone never see it — the 2026-11-06
+            live run left it open after a skip and it then blocked
+            every "..." click for the rest of the run."""
+            try:
+                confirm_loc = S.to_playwright(
+                    page, S.F_DELETE_PREVIOUS_CONFIRM_BUTTON)
+                return bool(confirm_loc.is_visible())
+            except Exception:
+                return False
 
         def _detail_dialog_open():
             try:
@@ -4442,17 +4457,29 @@ class PlaywrightDriver(BaseDriver):
                     return True, None
                 if _menu_open(timeout_s=1.0):
                     return True, None
+                if _confirm_open():
+                    # A confirm dialog left open by an earlier listing
+                    # is covering the page: no "..." button can be
+                    # clicked while it is up (Playwright's click waits
+                    # for the button to receive events, and the modal
+                    # overlay intercepts the click point). Say so
+                    # plainly instead of the misleading
+                    # menu_button_not_found.
+                    last_reason = "confirm_dialog_open"
+                    continue
                 last_reason = "menu_button_not_found"
             return False, last_reason
 
-        # A menu (or the detail dialog) left open by the previous
-        # listing must never survive into this listing's turn: it
-        # would scroll with the page, and its Delete link would be
-        # the previous listing's — deleting it twice. Close it
+        # A menu, the detail dialog, or the delete confirmation
+        # dialog left open by the previous listing must never survive
+        # into this listing's turn: it would scroll with the page,
+        # and its Delete link would be the previous listing's —
+        # deleting it twice — or, for the confirm dialog, it would
+        # cover the page and block every "..." click. Close it
         # before resolving this listing's "..." button. Runs once
         # per listing, not per retry: the retries below must not
         # close a menu that just opened.
-        if _menu_open() or _detail_dialog_open():
+        if _menu_open() or _detail_dialog_open() or _confirm_open():
             try:
                 page.keyboard.press("Escape")
             except Exception:
@@ -4520,6 +4547,17 @@ class PlaywrightDriver(BaseDriver):
             pass
         confirm_loc = _wait_for_confirm_button()
         if confirm_loc is None:
+            # The dialog never appeared — or it appeared and its
+            # Delete button could not be found. Either way, close
+            # whatever is open before skipping: a dialog left open
+            # here covers the page and blocks every "..." click for
+            # the rest of the run (2026-11-06 live run: 0/5, the
+            # dialog stayed open on the first listing).
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(0.5)
             return _skip("delete_confirm_not_found")
         try:
             confirm_loc.click(timeout=5000)
