@@ -5989,8 +5989,38 @@ class PlaywrightDriver(BaseDriver):
         seen: set[str] = set()
         try:
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
+            # Selling-page load wait (user order 2026-11-07, Delete Take
+            # Action Listings only): Facebook renders the cards
+            # asynchronously, so the old fixed 1.5–3s pause was not
+            # enough — the badge scan below read an empty page and
+            # reported "no flagged listings" while the listings were
+            # still loading. Poll until the FIRST listing is actually
+            # visible, with NO fixed time bound — the same wait Relist
+            # & Edit and Delete Previous use. A transient empty DOM is
+            # NOT a result.
+            while True:
+                try:
+                    links = page.locator(S.SCR_MY_LISTING_LINKS[1]).all()
+                    if any(h.is_visible() for h in links):
+                        break
+                except Exception:
+                    pass
+                try:
+                    buttons = page.locator(
+                        "xpath=" + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]).all()
+                    if any(h.is_visible() for h in buttons):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
             human.human_pause(1500, 3000)
-            badges = S.to_playwright(page, S.F_TAKE_ACTION_BADGE).all()
+            # All badges, not just the first: S.to_playwright appends
+            # .first, so .all() on it returns one element only (proven
+            # locally with real Playwright) — the scan could never
+            # return more than one flagged listing, so Min-Max above 1
+            # could never be met. The direct locator returns every
+            # flagged card on the page.
+            badges = page.locator(S.F_TAKE_ACTION_BADGE[1]).all()
             for badge in badges:
                 try:
                     card = badge.locator(

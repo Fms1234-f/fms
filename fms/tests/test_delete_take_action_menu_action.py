@@ -32,7 +32,9 @@ _TMP = tempfile.mkdtemp(prefix="fms_delete_take_action_")
 os.environ["FMS_DATA_DIR"] = _TMP
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import fms.browser as B  # noqa: E402
 import fms.engine as E  # noqa: E402
+from fms import selectors as S  # noqa: E402
 from fms.engine import RunConfig  # noqa: E402
 from fms.selectors import F_TAKE_ACTION_BADGE  # noqa: E402
 
@@ -219,3 +221,120 @@ def test_badge_selector_matches_identity_banner():
     # discovery selector must match that text, not only "Take action".
     assert "Confirm your identity" in F_TAKE_ACTION_BADGE[1]
     assert "Take action" in F_TAKE_ACTION_BADGE[1]
+
+
+# ------------------------------------------------------- fake selling page ---
+class _FakeLinkHandle:
+    """An item link whose visibility flips on after N polls."""
+
+    def __init__(self, page):
+        self.page = page
+
+    def is_visible(self):
+        self.page.polls += 1
+        if self.page.polls > self.page.max_polls:
+            raise AssertionError("waited too long for a visible listing")
+        return self.page.polls >= self.page.visible_after
+
+
+class _FakeLinksCollection:
+    def __init__(self, page):
+        self.page = page
+
+    def all(self):
+        return [_FakeLinkHandle(self.page) for _ in self.page.link_ids]
+
+
+class _FakeBadge:
+    """A 'take action' banner on one card."""
+
+    def __init__(self, listing_id):
+        self.listing_id = listing_id
+
+    def locator(self, sel):
+        return _FakeCardLink(self.listing_id)
+
+
+class _FakeCardLink:
+    def __init__(self, listing_id):
+        self.listing_id = listing_id
+        self.first = self
+
+    def get_attribute(self, name):
+        return f"https://www.facebook.com/marketplace/item/{self.listing_id}/"
+
+    def inner_text(self):
+        return f"TITLE {self.listing_id} £2"
+
+
+class _FakeBadgeCollection:
+    def __init__(self, page):
+        self.page = page
+
+    def all(self):
+        # Badges only exist once the cards have rendered.
+        if self.page.polls < self.page.visible_after:
+            return []
+        return [_FakeBadge(i) for i in self.page.flagged_ids]
+
+
+class _FakeEmptyCollection:
+    def all(self):
+        return []
+
+
+class _FakeTakeActionPage:
+    """Selling page where listings render late: item links are invisible
+    for the first N visibility checks, then appear with their banners."""
+
+    def __init__(self, flagged_ids, visible_after=3):
+        self.flagged_ids = list(flagged_ids)
+        self.link_ids = list(flagged_ids)
+        self.visible_after = visible_after
+        self.polls = 0
+        self.max_polls = 50
+
+    def goto(self, url, wait_until=None, timeout=None):
+        return None
+
+    def locator(self, sel):
+        if sel == S.SCR_MY_LISTING_LINKS[1]:
+            return _FakeLinksCollection(self)
+        if sel == S.F_TAKE_ACTION_BADGE[1]:
+            return _FakeBadgeCollection(self)
+        if sel == "xpath=" + S.F_RELIST_EDIT_CARD_MENU_BUTTON_SCOPED[1]:
+            return _FakeEmptyCollection()
+        raise AssertionError(f"unexpected selector {sel!r}")
+
+
+def _make_take_action_driver(page, monkeypatch):
+    drv = B.PlaywrightDriver.__new__(B.PlaywrightDriver)
+    drv.account = {}
+    drv._ensure = lambda: None
+    drv._page = page
+    monkeypatch.setattr(B.human, "human_pause", lambda *a, **k: None)
+    return drv
+
+
+def test_driver_waits_for_visible_listing_before_scanning_badges(monkeypatch):
+    # 2026-11-07 live behaviour: the selling page renders its cards
+    # asynchronously. The old code scanned for banners 1.5–3s after
+    # domcontentloaded and read an empty page, reporting "no flagged
+    # listings" while they were still loading. The discovery must poll
+    # until the first listing is actually visible, then scan.
+    page = _FakeTakeActionPage(["111", "222"], visible_after=3)
+    drv = _make_take_action_driver(page, monkeypatch)
+    flagged = drv.get_take_action_listings()
+    assert [f["id"] for f in flagged] == ["111", "222"]
+    assert page.polls >= 3, "waited for the listings to become visible"
+
+
+def test_driver_finds_all_flagged_not_just_first(monkeypatch):
+    # S.to_playwright appends .first, so .all() on it returns one
+    # element only — the scan could never return more than one flagged
+    # listing, and Min-Max above 1 could never be met. The direct
+    # locator must return every flagged card on the page.
+    page = _FakeTakeActionPage(["111", "222", "333"], visible_after=1)
+    drv = _make_take_action_driver(page, monkeypatch)
+    flagged = drv.get_take_action_listings()
+    assert [f["id"] for f in flagged] == ["111", "222", "333"]
