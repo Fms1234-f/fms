@@ -168,9 +168,12 @@ MKT_LOCATION_INPUT = ("css", "input[aria-label*='Location' i], "
 
 # ------------------------------------------------- "take action" flags ---
 # Listings Facebook flags with "take action" (identity/phone verification)
-# show a matching badge/banner on the selling page (best-effort).
+# show a matching badge/banner on the selling page (best-effort). The
+# banner itself reads "Confirm your identity to publish this and any
+# future listings" (user photo 2026-11-07), so that text is matched too.
 F_TAKE_ACTION_BADGE = ("css", "[aria-label*='take action' i], "
-                              "span:has-text('Take action')")
+                              "span:has-text('Take action'), "
+                              "span:has-text('Confirm your identity')")
 
 # ------------------------------------------------- draft & publish ---
 # Best-effort: Facebook's draft UI drifts; update here when it breaks.

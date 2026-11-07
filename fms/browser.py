@@ -5986,6 +5986,7 @@ class PlaywrightDriver(BaseDriver):
         page = self._page
         assert page is not None
         flagged: list[dict] = []
+        seen: set[str] = set()
         try:
             page.goto(S.MKT_YOUR_LISTINGS_URL, wait_until="domcontentloaded")
             human.human_pause(1500, 3000)
@@ -5996,7 +5997,10 @@ class PlaywrightDriver(BaseDriver):
                         "xpath=ancestor::a[contains(@href,'/marketplace/item/')][1]")
                     href = card.first.get_attribute("href") or ""
                     m = re.search(r"/marketplace/item/(\d+)/", href)
-                    if m:
+                    if m and m.group(1) not in seen:
+                        # Nested banner spans can match the same card
+                        # twice; keep each flagged listing once.
+                        seen.add(m.group(1))
                         flagged.append({
                             "id": m.group(1),
                             "title": (card.first.inner_text() or "").strip()[:120],

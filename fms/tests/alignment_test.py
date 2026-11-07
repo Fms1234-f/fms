@@ -200,11 +200,22 @@ def t_delete_take_action():
         {"id": "ta1", "title": "Flagged Sofa"},
         {"id": "ta2", "title": "Flagged Bed"},
     ]
-    rid = eng.start_run(start_cfg(db, gid, "delete_take_action"))
+    # Min = Max = 2 so the run deletes both flagged listings
+    # deterministically (want is random in [Min, Max]).
+    rid = eng.start_run(start_cfg(db, gid, "delete_take_action",
+                                  delete_take_action_min_count=2,
+                                  delete_take_action_max_count=2))
     run_to_end(eng, rid)
     assert len(events("get_take_action")) == 1
-    deleted_ids = {c["listing_id"] for c in events("delete_listing")}
+    # Menu workflow (user brief 2026-11-07): flagged listings are
+    # deleted from the selling page via the card menu ("Delete listing"
+    # + confirm), the same as Delete Previous — never the old direct
+    # delete_listing.
+    deleted_ids = {c["listing_id"] for c in events("delete_previous")}
     assert deleted_ids == {"ta1", "ta2"}, deleted_ids
+    assert all(c.get("via_menu") for c in events("delete_previous"))
+    assert not events("delete_listing"), \
+        "menu path must never fall back to the direct delete"
     n = db.fetchone("SELECT COUNT(*) AS c FROM listings WHERE run_id = ? "
                     "AND status = 'deleted'", (rid,))["c"]
     assert n == 2, n

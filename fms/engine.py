@@ -123,6 +123,8 @@ class RunConfig:
     relist_edit_max_count: int = 3  # own selling-page listings to edit
     delete_previous_min_count: int = 1  # Delete Previous: how many of the
     delete_previous_max_count: int = 3  # account's own selling-page listings to delete
+    delete_take_action_min_count: int = 1  # Delete Take Action Listings: how many
+    delete_take_action_max_count: int = 3  # of the account's flagged listings to delete
     relist_edit_price_direction: str = "descending"  # ascending | descending
     relist_edit_price_delta: float = 3.0  # price change amount (user's 2, 3, ...)
     create_listings_count: int = 1  # Create Listings Only: exact filled forms per account
@@ -196,6 +198,9 @@ class RunConfig:
         if (self.delete_previous_min_count < 1
                 or self.delete_previous_max_count < self.delete_previous_min_count):
             raise ValueError("bad delete_previous_min_count/delete_previous_max_count")
+        if (self.delete_take_action_min_count < 1
+                or self.delete_take_action_max_count < self.delete_take_action_min_count):
+            raise ValueError("bad delete_take_action_min_count/delete_take_action_max_count")
         if str(self.relist_edit_price_direction).strip().lower() not in ("ascending", "descending"):
             raise ValueError("relist_edit_price_direction must be ascending or descending")
         if self.relist_edit_price_delta < 0:
@@ -246,6 +251,8 @@ class RunConfig:
             "relist_edit_max_count": self.relist_edit_max_count,
             "delete_previous_min_count": self.delete_previous_min_count,
             "delete_previous_max_count": self.delete_previous_max_count,
+            "delete_take_action_min_count": self.delete_take_action_min_count,
+            "delete_take_action_max_count": self.delete_take_action_max_count,
             "relist_edit_price_direction": self.relist_edit_price_direction,
             "relist_edit_price_delta": self.relist_edit_price_delta,
             "min_price": self.min_price, "max_price": self.max_price,
@@ -2229,19 +2236,74 @@ class RunController:
                  account_id=account["id"])
 
     def _delete_take_action_flow(self, account: dict, driver) -> None:
-        """Delete listings Facebook flagged with a 'take action'
-        (identity/phone verification) requirement."""
+        """Delete Take Action Listings (user brief 2026-11-07): the SAME
+        selling-page menu workflow as Delete Previous, except ONLY
+        listings Facebook flagged with a 'take action' banner
+        ("Confirm your identity to publish this and any future
+        listings", user photo 2026-11-07) are deleted — one by one, in
+        selling-page order, until the Min-Max count for this account
+        is done. Per account: feed fully loaded -> Marketplace loaded
+        -> selling page loaded -> flagged listings only, each one's
+        "..." menu opened, "Delete listing" clicked, the delete dialog
+        confirmed (a "Did you sell this item?" survey is X-closed,
+        never answered). No product dataset is used; the selling page
+        is the source. An account with NO flagged listings is marked
+        Done at once (browser closed, next account) — it is not an
+        error and the run never waits for one. A menu-step failure
+        for a listing is a skip, NOT a silent direct-URL retry — the
+        menu method itself returns the skip, and the flow never
+        re-runs a failed listing directly. Returning without raising
+        lets the worker close the browser and move to the next
+        account, which restarts from its own first flagged listing.
+        Dialog shows only Min/Max delete take action listings."""
         label = account["label"]
-        flagged = driver.get_take_action_listings()
-        n = 0
-        for lst in flagged:
-            self._wait_if_paused()
-            lid = lst.get("id")
-            if lid and driver.delete_listing(lid):
-                self._record_deleted(account, lid, lst.get("title", ""))
-                n += 1
-        self.log(f"[{label}] deleted {n}/{len(flagged)} "
-                 f"'take action' listing(s)", account_id=account["id"])
+        lo = max(1, int(self.cfg.delete_take_action_min_count or 1))
+        hi = max(lo, int(self.cfg.delete_take_action_max_count or lo))
+        want = random.randint(lo, hi)
+        # Delete Take Action Listings ONLY: the card-menu path. No
+        # fallback to the old direct delete — the user asked for the
+        # menu workflow, and a menu-step failure is a skip, not a
+        # silent direct-URL retry.
+        method = getattr(driver, "delete_previous_listing_via_menu", None)
+        if not callable(method):
+            self.log(f"[{label}] Delete Take Action Listings requires a menu-capable browser driver",
+                     level="error", account_id=account["id"])
+            return
+        driver.open_url("https://www.facebook.com/")
+        driver.open_marketplace()
+        driver.open_url("https://www.facebook.com/marketplace/you/selling/")
+        # Flagged listings only, from the selling page itself
+        # (get_take_action_listings navigates there and returns the
+        # link ids + titles of the flagged cards).
+        flagged = driver.get_take_action_listings() or []
+        targets = [lst for lst in flagged if lst.get("id")][:want]
+        if not targets:
+            self.log(f"[{label}] No 'take action' listings available to delete; account marked Done",
+                     account_id=account["id"])
+            return
+        deleted = 0
+        failed = 0
+        for lst in targets:
+            result = method(lst["id"])
+            if isinstance(result, dict) and result.get("ok"):
+                deleted += 1
+                self.log(f"[{label}] Delete Take Action Listings: deleted {lst['id']}",
+                         account_id=account["id"])
+                # Keep the DB truthful, as the other delete flows do:
+                # a link-backed listing has a real Facebook id; a
+                # card-token listing ("card:N") has none, so there is
+                # nothing to record for it.
+                if not str(lst["id"]).startswith("card:"):
+                    self._record_deleted(account, lst["id"],
+                                         lst.get("title", "") or "")
+            else:
+                failed += 1
+                reason = result.get("reason") if isinstance(result, dict) else "unknown"
+                self.log(f"[{label}] Delete Take Action Listings: skipped {lst['id']} ({reason}); nothing deleted",
+                         level="warning", account_id=account["id"])
+        self.log(f"[{label}] Delete Take Action Listings: deleted {deleted}/{len(targets)} listing(s)"
+                 + (f" ({failed} skipped)" if failed else ""),
+                 account_id=account["id"])
 
     def _delete_all_invalid_flow(self, account: dict, driver) -> None:
         """Delete every failed/invalid listing tracked for this account."""

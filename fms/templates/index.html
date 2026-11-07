@@ -145,12 +145,13 @@ function configureMinMaxDialog(){
   const isChangeLocation = selectedAction === 'change_location';
   const isRelistEdit = selectedAction === 'relist_edit';
   const isDeletePrevious = selectedAction === 'delete_previous';
+  const isDeleteTakeAction = selectedAction === 'delete_take_action';
   const isCountOnly = isRenew1 || isDeleteRelist || isPublishDrafts;
-  document.getElementById('mmMinLabel').textContent = isRelistEdit ? 'Min Relist & Edit' : (isDeletePrevious ? 'Min delete' : (isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings')))));
+  document.getElementById('mmMinLabel').textContent = isRelistEdit ? 'Min Relist & Edit' : (isDeletePrevious ? 'Min delete' : (isDeleteTakeAction ? 'Min delete take action listings' : (isCreateListingsOnly ? 'No. of Listings' : (isPublishDrafts ? 'Min Publish Drafts' : (isDeleteRelist ? 'Min Delete & Relist' : (isRenew1 ? 'Min Renew Listings' : 'Min listings'))))));
   document.getElementById('mmMaxAdsField').style.display = isLaunchFast ? 'none' : (isCreateListingsOnly ? 'none' : (isChangeLocation ? 'none' : ''));
-  document.getElementById('mmMaxLabel').textContent = isRelistEdit ? 'Max Relist & Edit' : (isDeletePrevious ? 'Max delete' : (isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings'))));
-  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : (isDeletePrevious ? 'none' : ''))))));
-  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : (isDeletePrevious ? 'none' : ''))))));
+  document.getElementById('mmMaxLabel').textContent = isRelistEdit ? 'Max Relist & Edit' : (isDeletePrevious ? 'Max delete' : (isDeleteTakeAction ? 'Max delete take action listings' : (isPublishDrafts ? 'Max Publish Drafts' : (isDeleteRelist ? 'Max Delete & Relist' : (isRenew1 ? 'Max Renew Listings' : 'Max listings')))));
+  document.getElementById('mmMinPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : (isDeletePrevious ? 'none' : (isDeleteTakeAction ? 'none' : '')))))));
+  document.getElementById('mmMaxPriceField').style.display = isLaunchFast ? 'none' : (isPublishDrafts ? 'none' : (isRenew1 ? 'none' : (isDeleteRelist ? 'none' : (isChangeLocation ? 'none' : (isRelistEdit ? 'none' : (isDeletePrevious ? 'none' : (isDeleteTakeAction ? 'none' : '')))))));
   document.getElementById('mmMinAdsField').style.display = isLaunchFast ? 'none' : (isChangeLocation ? 'none' : '');
   document.getElementById('mmRelistEditField').style.display = isRelistEdit ? '' : 'none';
   document.getElementById('mmLaunchUrlField').style.display = isLaunchFast ? '' : 'none';
@@ -166,8 +167,9 @@ function configureMinMaxDialog(){
     : (isRenew1 ? 'Har account ke liye Min–Max ke darmiyan eligible listings renew karne ki koshish hogi.'
     : (isRelistEdit ? 'Har ID ki apni selling list ke start se Min–Max ke darmiyan listings ki price change hogi: Ascending = maujooda price + amount, Descending = maujooda price − amount.'
     : (isDeletePrevious ? 'Har ID ki apni selling list ke start se Min–Max ke darmiyan listings delete hongi: 3 dots → Delete listing.'
+    : (isDeleteTakeAction ? 'Har ID ki apni selling list se sirf "Confirm your identity" wali listings delete hongi: 3 dots → Delete listing.'
     : (isChangeLocation ? 'Har ID par Marketplace ki location isi naam par set hogi, phir ID Done mein jayegi aur browser close hoga.'
-    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.')))))));
+    : 'Har ID pe Min–Max ke darmiyan listings hongi, har listing ki price Min–Max ke darmiyan hogi.'))))))));
 }
 async function startRun(){
   const gids = selectedGroups();
@@ -270,6 +272,10 @@ async function _doStartRun(){
     // Delete Previous: count only; no price-filter fields.
     body.delete_previous_min_count = _minA;
     body.delete_previous_max_count = _maxA;
+  } else if(actVal === 'delete_take_action'){
+    // Delete Take Action Listings: count only; no price-filter fields.
+    body.delete_take_action_min_count = _minA;
+    body.delete_take_action_max_count = _maxA;
   } else {
     // Preserve the existing Post and other actions' price-filter behavior.
     const _minP = parseFloat(_mm('mmMinPrice').value);
