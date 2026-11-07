@@ -5980,9 +5980,12 @@ class PlaywrightDriver(BaseDriver):
     def get_take_action_listings(self) -> list[dict]:
         """Best-effort: find the flagged listings on the selling page.
 
-        The top listings, in page order, are checked by their own
-        card text for the flag ("Confirm your identity") — no banner
-        search. Each flagged card keeps its link id + title."""
+        The "Confirm your identity" line is found directly on the
+        page and each occurrence is mapped to its listing through
+        the nearest ancestor holding an item link. Returns [{id,
+        title}] in page order (top first). Also records
+        take_action_last_discovery {listings_seen, flags_found} so
+        the Logs show what was actually seen."""
         import re
 
         self._ensure()
@@ -6017,22 +6020,39 @@ class PlaywrightDriver(BaseDriver):
                     pass
                 time.sleep(0.5)
             human.human_pause(1500, 3000)
-            # Top listings, in page order — NO banner search (user
-            # direction 2026-11-07): the flagged listings sit at the
-            # top of the selling page. Each listing's own card text is
-            # checked for the flag ("Confirm your identity", the text
-            # from the user's photo). The card is the nearest ancestor
-            # holding a "..." button — the same ancestor the delete
-            # menu's card snapshot uses. A card whose text carries the
-            # flag is flagged; the rest are skipped.
-            card_ancestor = (
-                "xpath=ancestor::*[count(.//*["
-                + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
-            for handle in page.locator(S.SCR_MY_LISTING_LINKS[1]).all():
-                try:
-                    if not handle.is_visible():
+            # The flag line, found directly on the page (user direction
+            # 2026-11-07): the banner reads "Confirm your identity to
+            # publish this and any future listings" (user photo). The
+            # old card-text check read the card through its "..."
+            # button, so a banner sitting outside that card was never
+            # seen — the run reported "no flagged listings" while the
+            # banners were visible. :text() matches the smallest
+            # element carrying the line, in any element type, and each
+            # match is mapped to its listing through the nearest
+            # ancestor holding an item link. No "take action" word
+            # matching: the line itself is the flag.
+            listings_seen = 0
+            try:
+                for h in page.locator(S.SCR_MY_LISTING_LINKS[1]).all():
+                    try:
+                        if h.is_visible():
+                            listings_seen += 1
+                    except Exception:
                         continue
-                    href = handle.get_attribute("href") or ""
+            except Exception:
+                listings_seen = 0
+            self.take_action_last_discovery = {
+                "listings_seen": listings_seen, "flags_found": 0}
+            flag_matches = page.locator(":text('Confirm your identity')").all()
+            for banner in flag_matches:
+                try:
+                    card = banner.locator(
+                        "xpath=ancestor::*[.//a[contains(@href,"
+                        "'/marketplace/item/')]][1]")
+                    if not card.count():
+                        continue
+                    link = card.locator("a[href*='/marketplace/item/']")
+                    href = link.first.get_attribute("href") or ""
                 except Exception:
                     continue
                 if "/marketplace/item/" not in href:
@@ -6042,25 +6062,11 @@ class PlaywrightDriver(BaseDriver):
                     continue
                 seen.add(lid)
                 try:
-                    card = handle.locator(card_ancestor)
-                    raw = ""
-                    if card.count():
-                        raw = card.first.inner_text() or ""
-                except Exception:
-                    continue
-                text = " ".join(str(raw).split()).lower()
-                if len(text) > 2000:
-                    # Not a single card (a list-level ancestor) — its
-                    # text could carry another card's flag.
-                    continue
-                if ("confirm your identity" not in text
-                        and "take action" not in text):
-                    continue
-                try:
-                    title = (handle.inner_text() or "").strip()[:120]
+                    title = (card.first.inner_text() or "").strip()[:120]
                 except Exception:
                     title = ""
                 flagged.append({"id": lid, "title": title})
+            self.take_action_last_discovery["flags_found"] = len(flagged)
         except Exception:
             pass
         return flagged

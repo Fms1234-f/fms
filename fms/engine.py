@@ -2277,10 +2277,23 @@ class RunController:
         # link ids + titles of the flagged cards).
         flagged = driver.get_take_action_listings() or []
         targets = [lst for lst in flagged if lst.get("id")][:want]
+        # Discovery counts (the driver records what it actually saw):
+        # the Logs must show the evidence, not just "none found".
+        disc = getattr(driver, "take_action_last_discovery", None) or {}
+        seen_n = disc.get("listings_seen")
+        found_n = disc.get("flags_found")
         if not targets:
-            self.log(f"[{label}] No 'take action' listings available to delete; account marked Done",
-                     account_id=account["id"])
+            if seen_n is not None:
+                self.log(f"[{label}] No 'take action' listings available to delete "
+                         f"(checked {seen_n} listings, {found_n} flagged); account marked Done",
+                         account_id=account["id"])
+            else:
+                self.log(f"[{label}] No 'take action' listings available to delete; account marked Done",
+                         account_id=account["id"])
             return
+        if seen_n is not None:
+            self.log(f"[{label}] Found {len(flagged)} flagged listing(s) out of {seen_n} checked; deleting {len(targets)}",
+                     account_id=account["id"])
         deleted = 0
         failed = 0
         for lst in targets:
