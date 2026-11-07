@@ -5978,8 +5978,11 @@ class PlaywrightDriver(BaseDriver):
         return {"title": data.get("title", ""), "photo_paths": photo_paths}
 
     def get_take_action_listings(self) -> list[dict]:
-        """Best-effort: find listings flagged with a 'take action' badge on
-        the selling page, then extract their listing ids from link hrefs."""
+        """Best-effort: find the flagged listings on the selling page.
+
+        The top listings, in page order, are checked by their own
+        card text for the flag ("Confirm your identity") — no banner
+        search. Each flagged card keeps its link id + title."""
         import re
 
         self._ensure()
@@ -6014,29 +6017,50 @@ class PlaywrightDriver(BaseDriver):
                     pass
                 time.sleep(0.5)
             human.human_pause(1500, 3000)
-            # All badges, not just the first: S.to_playwright appends
-            # .first, so .all() on it returns one element only (proven
-            # locally with real Playwright) — the scan could never
-            # return more than one flagged listing, so Min-Max above 1
-            # could never be met. The direct locator returns every
-            # flagged card on the page.
-            badges = page.locator(S.F_TAKE_ACTION_BADGE[1]).all()
-            for badge in badges:
+            # Top listings, in page order — NO banner search (user
+            # direction 2026-11-07): the flagged listings sit at the
+            # top of the selling page. Each listing's own card text is
+            # checked for the flag ("Confirm your identity", the text
+            # from the user's photo). The card is the nearest ancestor
+            # holding a "..." button — the same ancestor the delete
+            # menu's card snapshot uses. A card whose text carries the
+            # flag is flagged; the rest are skipped.
+            card_ancestor = (
+                "xpath=ancestor::*[count(.//*["
+                + S.F_RELIST_EDIT_MENU_BUTTON_XPATH_PRED + "])>0][1]")
+            for handle in page.locator(S.SCR_MY_LISTING_LINKS[1]).all():
                 try:
-                    card = badge.locator(
-                        "xpath=ancestor::a[contains(@href,'/marketplace/item/')][1]")
-                    href = card.first.get_attribute("href") or ""
-                    m = re.search(r"/marketplace/item/(\d+)/", href)
-                    if m and m.group(1) not in seen:
-                        # Nested banner spans can match the same card
-                        # twice; keep each flagged listing once.
-                        seen.add(m.group(1))
-                        flagged.append({
-                            "id": m.group(1),
-                            "title": (card.first.inner_text() or "").strip()[:120],
-                        })
+                    if not handle.is_visible():
+                        continue
+                    href = handle.get_attribute("href") or ""
                 except Exception:
                     continue
+                if "/marketplace/item/" not in href:
+                    continue
+                lid = href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+                if not lid or lid in seen:
+                    continue
+                seen.add(lid)
+                try:
+                    card = handle.locator(card_ancestor)
+                    raw = ""
+                    if card.count():
+                        raw = card.first.inner_text() or ""
+                except Exception:
+                    continue
+                text = " ".join(str(raw).split()).lower()
+                if len(text) > 2000:
+                    # Not a single card (a list-level ancestor) — its
+                    # text could carry another card's flag.
+                    continue
+                if ("confirm your identity" not in text
+                        and "take action" not in text):
+                    continue
+                try:
+                    title = (handle.inner_text() or "").strip()[:120]
+                except Exception:
+                    title = ""
+                flagged.append({"id": lid, "title": title})
         except Exception:
             pass
         return flagged
